@@ -4,34 +4,28 @@ import torch.nn as nn
 from tokenizers import Tokenizer, decoders, pre_tokenizers, trainers, models
 import glob
 from torch.utils.data import Dataset, DataLoader
-from refresh import extract_text_from_pdfs_and_txts
+from refresh import extract_text_from_pdfs_and_txts, create_tokenizer
 from tqdm import tqdm 
-from torch.cuda.amp import autocast, GradScaler
+from torch.cuda.amp import GradScaler
 
 # =====================
 # 1. TOKENIZER SETUP
 # =====================
 def initialize_tokenizer(forModel= "forModel"):
-    """Load pre-trained tokenizer"""
     tokenizer_path = os.path.join(forModel, "bpe_tokenizer.json")
     if not glob.glob(tokenizer_path) or os.path.getsize(tokenizer_path) == 0:
-        if not os.path.exists(forModel):
-            os.makedirs(forModel, exist_ok=True)
-        tokenizer = Tokenizer(models.BPE())
-        tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
-        trainer = trainers.BpeTrainer(
-            vocab_size=2000,
-            show_progress=True,
-            special_tokens=["<unk>", "<pad>", "<bos>", "<eos>"]
-            )
-        text = extract_text_from_pdfs_and_txts()
-        tokenizer.train_from_iterator([text], trainer)
-        tokenizer.decoder = decoders.BPEDecoder()
-        os.makedirs(os.path.dirname(tokenizer_path), exist_ok=True)
-        tokenizer.save(tokenizer_path)
+        data_path = os.path.join(forModel, "data_corpus.txt")
+        if not os.path.exists(data_path) or os.path.getsize(data_path) == 0:
+            os.makedirs(data_path, exist_ok=True)
+            text = extract_text_from_pdfs_and_txts()
+        else:
+            with open(data_path, "r", encoding="utf-8") as f:
+                text = f.read()
+        create_tokenizer(text)
     else:
-        tokenizer = Tokenizer.from_file(tokenizer_path)
-        tokenizer.decoder = decoders.BPEDecoder()
+        pass
+    tokenizer = Tokenizer.from_file(tokenizer_path)
+    tokenizer.decoder = decoders.BPEDecoder()
     return tokenizer
 
 # =====================
@@ -112,11 +106,11 @@ def train_model(tokenizer, forModel="forModel"):
     save_path = os.path.join(forModel, "gpt_model.pth")
     # Initialize dataset and dataloader
     if not os.path.exists(corpus_path) or os.path.getsize(corpus_path) == 0:
-        pdf_text = extract_text_from_pdfs_and_txts()
+        text = extract_text_from_pdfs_and_txts()
     else:
         with open(corpus_path, "r", encoding="utf-8") as f:
-            pdf_text = f.read()
-    dataset = TextDataset(pdf_text, tokenizer, seq_len=128)
+            text = f.read()
+    dataset = TextDataset(text, tokenizer, seq_len=128)
     if len(dataset) <= 500:
         print("ERROR: Not enough data to create even one training sample. "
               "Please check your PDF files or reduce seq_len.")
@@ -133,8 +127,6 @@ def train_model(tokenizer, forModel="forModel"):
     use_amp = torch.cuda.is_available()
     if use_amp:
         scaler = GradScaler()
-
-    # --- Improved Training time estimation ---
     import time
     sample_batch = next(iter(dataloader))
     inputs = sample_batch["input_ids"].to(device)

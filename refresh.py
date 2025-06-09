@@ -1,6 +1,7 @@
 import os
 import glob
 import PyPDF2
+from tokenizers import Tokenizer, models, pre_tokenizers, trainers, decoders
 
 def extract_text_from_pdfs_and_txts(folder="data", forModel="forModel"):
     textAll = ""
@@ -42,6 +43,19 @@ def extract_text_from_pdfs_and_txts(folder="data", forModel="forModel"):
     
     return textAll
     
+def create_tokenizer(text, forModel="forModel"):
+    tokenizer_path = os.path.join(forModel, "bpe_tokenizer.json")
+    os.makedirs(forModel, exist_ok=True)
+    tokenizer = Tokenizer(models.BPE())
+    tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
+    trainer = trainers.BpeTrainer(
+        vocab_size=2000,
+        show_progress=True,
+        special_tokens=["<unk>", "<pad>", "<bos>", "<eos>"]
+    )
+    tokenizer.train_from_iterator([text], trainer)
+    tokenizer.decoder = decoders.BPEDecoder()
+    tokenizer.save(tokenizer_path)
 
 if __name__ == "__main__":
     # Extract text from PDFs and TXT files

@@ -1,0 +1,212 @@
+import os
+import torch
+import torch.nn as nn
+from tokenizers import Tokenizer, decoders, pre_tokenizers, trainers, models
+import glob
+from torch.utils.data import Dataset, DataLoader
+from refresh import extract_text_from_pdfs_and_txts
+from tqdm import tqdm 
+
+# =====================
+# 1. TOKENIZER SETUP
+# =====================
+def initialize_tokenizer(forModel= "forModel"):
+    """Load pre-trained tokenizer"""
+    tokenizer_path = os.path.join(forModel, "bpe_tokenizer.json")
+    if not glob.glob(tokenizer_path) or os.path.getsize(tokenizer_path) == 0:
+        if not os.path.exists(forModel):
+            os.makedirs(forModel, exist_ok=True)
+        tokenizer = Tokenizer(models.BPE())
+        tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
+        trainer = trainers.BpeTrainer(
+            vocab_size=2000,
+            show_progress=True,
+            special_tokens=["<unk>", "<pad>", "<bos>", "<eos>"]
+            )
+        text = extract_text_from_pdfs_and_txts()
+        tokenizer.train_from_iterator([text], trainer)
+        tokenizer.decoder = decoders.BPEDecoder()
+        os.makedirs(os.path.dirname(tokenizer_path), exist_ok=True)
+        tokenizer.save(tokenizer_path)
+    else:
+        tokenizer = Tokenizer.from_file(tokenizer_path)
+        tokenizer.decoder = decoders.BPEDecoder()
+    return tokenizer
+
+# =====================
+# 2. DATASET HANDLING
+# =====================
+class TextDataset(Dataset):
+    def __init__(self, text, tokenizer, seq_len=128):
+        self.tokenizer = tokenizer
+        # Encode the entire text as token IDs
+        self.tokens = tokenizer.encode(text).ids
+        # Split into sequences of length seq_len
+        self.seq_len = seq_len
+        self.samples = []
+        for i in range(0, len(self.tokens) - seq_len, seq_len):
+            input_ids = self.tokens[i:i+seq_len]
+            labels = self.tokens[i+1:i+seq_len+1]
+            if len(labels) < seq_len:
+                continue
+            self.samples.append((input_ids, labels))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        input_ids, labels = self.samples[idx]
+        return {
+            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "labels": torch.tensor(labels, dtype=torch.long)
+        }
+
+# =====================
+# 3. MODEL DEFINITION
+# =====================
+class NanoGPT(nn.Module):
+    def __init__(self, vocab_size, embed_size=256, n_layers=64, n_heads=8):
+        super().__init__()
+        self.token_embed = nn.Embedding(vocab_size, embed_size)
+        self.pos_embed = nn.Embedding(1024, embed_size)
+        
+        # Transformer blocks
+        self.blocks = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=embed_size,
+                nhead=n_heads,
+                dim_feedforward=4*embed_size,
+                batch_first=True
+            ) for _ in range(n_layers)
+        ])
+        
+        self.ln_final = nn.LayerNorm(embed_size)
+        self.lm_head = nn.Linear(embed_size, vocab_size)
+    
+    def forward(self, input_ids):
+        device = input_ids.device
+        batch_size, seq_len = input_ids.shape
+        
+        # Create position IDs
+        pos_ids = torch.arange(0, seq_len, device=device).unsqueeze(0)
+        
+        # Embed tokens and positions
+        token_embeds = self.token_embed(input_ids)
+        pos_embeds = self.pos_embed(pos_ids)
+        x = token_embeds + pos_embeds
+        
+        # Process through transformer blocks
+        for block in self.blocks:
+            x = block(x)
+        
+        x = self.ln_final(x)
+        return self.lm_head(x)
+
+# =====================
+# 4. TRAINING FUNCTION
+# =====================
+def train_model(tokenizer, forModel="forModel"):
+    """Full training procedure"""
+    corpus_path = os.path.join(forModel, "data_corpus.txt")
+    save_path = os.path.join(forModel, "gpt_model.pth")
+    # Initialize dataset and dataloader
+    if not os.path.exists(corpus_path) or os.path.getsize(corpus_path) == 0:
+        pdf_text = extract_text_from_pdfs_and_txts()
+    else:
+        with open(corpus_path, "r", encoding="utf-8") as f:
+            pdf_text = f.read()
+    dataset = TextDataset(pdf_text, tokenizer, seq_len=128)
+    if len(dataset) <= 500:
+        print("ERROR: Not enough data to create even one training sample. "
+              "Please check your PDF files or reduce seq_len.")
+        return None
+    dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+
+    # Initialize model
+    model = NanoGPT(vocab_size=tokenizer.get_vocab_size())
+    optimizer = torch.optim.AdamW(model.parameters(), lr=6e-4)
+    loss_fn = nn.CrossEntropyLoss()
+
+    # Training loop
+    model.train()
+    for epoch in range(3):  # 3 epochs for demonstration
+        total_loss = 0
+        batch_iter = tqdm(dataloader, desc=f"Epoch {epoch+1}", unit="batch")
+        for batch in batch_iter:
+            inputs = batch["input_ids"]
+            targets = batch["labels"]
+
+            logits = model(inputs)
+            loss = loss_fn(logits.view(-1, logits.size(-1)), targets.view(-1))
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+            batch_iter.set_postfix(loss=loss.item())
+
+        print(f"Epoch {epoch+1} | Avg Loss: {total_loss/len(dataloader):.4f}")
+
+    # Save trained model
+    torch.save(model.state_dict(), save_path)
+    print(f"Model saved to {save_path}")
+    return model
+
+# =====================
+# 5. GENERATION FUNCTION
+# =====================
+def generate_text(model, tokenizer, prompt, max_length=50, temperature=0.8):
+    """Generate text from prompt"""
+    model.eval()
+    input_ids = tokenizer.encode(prompt).ids
+
+    eos_token = "<eos>"
+    eos_token_id = tokenizer.token_to_id(eos_token)
+
+    for _ in range(max_length):
+        with torch.no_grad():
+            inputs = torch.tensor([input_ids], dtype=torch.long)
+            logits = model(inputs)
+            next_logits = logits[0, -1, :] / temperature
+            probs = torch.softmax(next_logits, dim=-1)
+            next_id = torch.multinomial(probs, num_samples=1).item()
+        input_ids.append(next_id)
+        if next_id == eos_token_id:
+            break
+
+    return tokenizer.decode(input_ids)
+
+# =====================
+# MAIN EXECUTION
+# =====================
+def main():
+    # Initialize tokenizer (using your pre-trained BPE)
+    tokenizer = initialize_tokenizer()
+    model_path = os.path.join("forModel", "gpt_model.pth")
+    
+    # Check if model exists
+    if not os.path.exists(model_path) or os.path.getsize(model_path) == 0:
+        print("Training model...")
+        model = train_model(tokenizer)
+        if model is None:
+            print("Model training failed. Exiting.")
+            return
+    else:
+        print("Loading pre-trained model...")
+        model = NanoGPT(vocab_size=tokenizer.get_vocab_size())
+        model.load_state_dict(torch.load(model_path))
+    
+    # Interactive generation loop
+    print("\nGPT Ready! Type your prompt (or 'quit' to exit)")
+    while True:
+        prompt = input("\nPrompt: ")
+        if prompt.lower() in ["quit", "exit"]:
+            break
+        
+        # Generate and print response
+        response = generate_text(model, tokenizer, prompt)
+        print(f"Generated: {response}")
+
+if __name__ == "__main__":
+    main()

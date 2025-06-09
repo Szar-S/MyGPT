@@ -69,9 +69,9 @@ class NanoGPT(nn.Module):
         self.token_embed = nn.Embedding(vocab_size, embed_size)
         self.pos_embed = nn.Embedding(1024, embed_size)
         
-        # Transformer blocks
+        # Use TransformerEncoderLayer for GPT-style model
         self.blocks = nn.ModuleList([
-            nn.TransformerDecoderLayer(
+            nn.TransformerEncoderLayer(
                 d_model=embed_size,
                 nhead=n_heads,
                 dim_feedforward=4*embed_size,
@@ -94,9 +94,12 @@ class NanoGPT(nn.Module):
         pos_embeds = self.pos_embed(pos_ids)
         x = token_embeds + pos_embeds
         
+        # Apply causal mask for autoregressive behavior
+        mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1).bool()
+        
         # Process through transformer blocks
         for block in self.blocks:
-            x = block(x)
+            x = block(x, src_key_padding_mask=None, src_mask=mask)
         
         x = self.ln_final(x)
         return self.lm_head(x)

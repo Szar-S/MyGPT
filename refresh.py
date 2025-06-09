@@ -61,6 +61,7 @@ if __name__ == "__main__":
     # Extract text from PDFs and TXT files
     textAll = extract_text_from_pdfs_and_txts()
     if textAll:
+        create_tokenizer(textAll)
         print("Text extraction complete. Data saved to 'forModel/data_corpus.txt'.")
     else:
         print("No text extracted. Please check your files.")

@@ -8,22 +8,38 @@ from refresh import extract_text_from_pdfs_and_txts, create_tokenizer
 from tqdm import tqdm 
 from torch.cuda.amp import GradScaler
 
+config = {
+    "forModel": "forModel",
+    "forData": "data",
+    "modal_path": "gpt_model.pth",
+    "data_corpus": "data_corpus.txt",
+    "bpe_tokenizer": "bpe_tokenizer.json",
+    "vocab_size": 50257,         # int
+    "seq_len": 128,              # int
+    "batch_size": 8,             # int
+    "epochs": 3,                 # int
+    "learning_rate": 6e-4,       # float
+    "embed_size": 256,           # int
+    "n_layers": 32,              # int
+    "n_heads": 4                 # int
+}
+
 # =====================
 # 1. TOKENIZER SETUP
 # =====================
-def initialize_tokenizer(forModel= "forModel"):
-    tokenizer_path = os.path.join(forModel, "bpe_tokenizer.json")
+def initialize_tokenizer(forModel=None):
+    if forModel is None:
+        forModel = config["forModel"]
+    tokenizer_path = os.path.join(forModel, config["bpe_tokenizer"])
     if not glob.glob(tokenizer_path) or os.path.getsize(tokenizer_path) == 0:
-        data_path = os.path.join(forModel, "data_corpus.txt")
+        data_path = os.path.join(forModel, config["data_corpus"])
         if not os.path.exists(data_path) or os.path.getsize(data_path) == 0:
-            os.makedirs(data_path, exist_ok=True)
+            os.makedirs(forModel, exist_ok=True)
             text = extract_text_from_pdfs_and_txts()
         else:
             with open(data_path, "r", encoding="utf-8") as f:
                 text = f.read()
         create_tokenizer(text)
-    else:
-        pass
     tokenizer = Tokenizer.from_file(tokenizer_path)
     tokenizer.decoder = decoders.BPEDecoder()
     return tokenizer
@@ -32,8 +48,10 @@ def initialize_tokenizer(forModel= "forModel"):
 # 2. DATASET HANDLING
 # =====================
 class TextDataset(Dataset):
-    def __init__(self, text, tokenizer, seq_len=128):
+    def __init__(self, text, tokenizer, seq_len=None):
         self.tokenizer = tokenizer
+        if seq_len is None:
+            seq_len = config["seq_len"]
         # Encode the entire text as token IDs
         self.tokens = tokenizer.encode(text).ids
         # Add special tokens
@@ -64,8 +82,14 @@ class TextDataset(Dataset):
 # 3. MODEL DEFINITION
 # =====================
 class NanoGPT(nn.Module):
-    def __init__(self, vocab_size, embed_size=256, n_layers=32, n_heads=4):
+    def __init__(self, vocab_size, embed_size=None, n_layers=None, n_heads=None):
         super().__init__()
+        if embed_size is None:
+            embed_size = config["embed_size"]
+        if n_layers is None:
+            n_layers = config["n_layers"]
+        if n_heads is None:
+            n_heads = config["n_heads"]
         self.token_embed = nn.Embedding(vocab_size, embed_size)
         self.pos_embed = nn.Embedding(1024, embed_size)
         
@@ -107,29 +131,35 @@ class NanoGPT(nn.Module):
 # =====================
 # 4. TRAINING FUNCTION
 # =====================
-def train_model(tokenizer, forModel="forModel"):
-    """Full training procedure"""
-    corpus_path = os.path.join(forModel, "data_corpus.txt")
-    save_path = os.path.join(forModel, "gpt_model.pth")
+def train_model(tokenizer, forModel=None):
+    if forModel is None:
+        forModel = config["forModel"]
+    corpus_path = os.path.join(forModel, config["data_corpus"])
+    save_path = os.path.join(forModel, config["modal_path"])
     # Initialize dataset and dataloader
     if not os.path.exists(corpus_path) or os.path.getsize(corpus_path) == 0:
         text = extract_text_from_pdfs_and_txts()
     else:
         with open(corpus_path, "r", encoding="utf-8") as f:
             text = f.read()
-    dataset = TextDataset(text, tokenizer, seq_len=128)
+    dataset = TextDataset(text, tokenizer, config["seq_len"])
     if len(dataset) <= 300:
         print("ERROR: Not enough data to create even one training sample. "
               "Please check your PDF files or reduce seq_len.")
         input("Press Enter to exit...")
         return None
-    dataloader = DataLoader(dataset, batch_size=8, shuffle=True, num_workers=0)
+    dataloader = DataLoader(dataset, batch_size=config["batch_size"], shuffle=True, num_workers=0)
 
     # Initialize model
-    model = NanoGPT(vocab_size=tokenizer.get_vocab_size())
+    model = NanoGPT(
+        vocab_size=tokenizer.get_vocab_size(),
+        embed_size=config["embed_size"],
+        n_layers=config["n_layers"],
+        n_heads=config["n_heads"]
+    )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=6e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config["learning_rate"])
     loss_fn = nn.CrossEntropyLoss()
 
     use_amp = torch.cuda.is_available()
@@ -157,14 +187,14 @@ def train_model(tokenizer, forModel="forModel"):
     end_time = time.time()
     batch_time = end_time - start_time
     num_batches = len(dataloader)
-    epochs = 3
+    epochs = config["epochs"]
     estimated_total = batch_time * num_batches * epochs
     mins, secs = divmod(int(estimated_total), 60)
     print(f"Estimated training time for {epochs} epochs: {mins} min {secs} sec")
 
     # Training loop
     model.train()
-    for epoch in range(3):  # 3 epochs for demonstration
+    for epoch in range(epochs):
         total_loss = 0
         batch_iter = tqdm(dataloader, desc=f"Epoch {epoch+1}", unit="batch", leave=True, dynamic_ncols=True)
         for batch in batch_iter:
@@ -225,7 +255,7 @@ def generate_text(model, tokenizer, prompt, max_length=50, temperature=0.8):
 def main():
     # Initialize tokenizer (using your pre-trained BPE)
     tokenizer = initialize_tokenizer()
-    model_path = os.path.join("forModel", "gpt_model.pth")
+    model_path = os.path.join(config["forModel"], config["modal_path"])
     
     # Check if model exists
     if not os.path.exists(model_path) or os.path.getsize(model_path) == 0:
@@ -236,7 +266,12 @@ def main():
             return
     else:
         print("Loading pre-trained model...")
-        model = NanoGPT(vocab_size=tokenizer.get_vocab_size())
+        model = NanoGPT(
+            vocab_size=tokenizer.get_vocab_size(),
+            embed_size=config["embed_size"],
+            n_layers=config["n_layers"],
+            n_heads=config["n_heads"]
+        )
         model.load_state_dict(torch.load(model_path))
     
     # Interactive generation loop

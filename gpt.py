@@ -54,9 +54,10 @@ class TextDataset(Dataset):
         return max(1,self.file_size // (self.seq_len * 4))
     def __getitem__(self, idx):
         start_pos = idx * self.seq_len
-        with open(self.corpus_path, "r", encoding="utf-8") as f:
+        with open(self.corpus_path, "rb") as f:
             f.seek(start_pos)
-            text_chunk = f.read(self.seq_len * 10)
+            raw_bytes = f.read(self.seq_len * 10)
+            text_chunk = raw_bytes.decode("utf-8", errors="replace")
         tokens = [self.bos_id] + self.tokenizer.encode(text_chunk).ids
         if len(tokens) < self.seq_len + 1:
             tokens += [self.eos_id] + [self.pad_id] * (self.seq_len - len(tokens))

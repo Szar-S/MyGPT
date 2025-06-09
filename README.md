@@ -22,6 +22,15 @@ A minimal, self-hosted GPT-style text generation model for local experimentation
     ```
 4. Follow the prompts to train or load the model and generate text.
 
+5. If you added new data or deleted previous data run the updater script:
+    ```sh
+    python refresh.py
+    ```
+6. Then backup the previous model stored in forModel named gpt_model. Run the main script to train:
+    ```sh
+    python gpt.py
+    ```
+
 ## License
 
 MIT License © Szar-S

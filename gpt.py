@@ -6,6 +6,7 @@ import glob
 from torch.utils.data import Dataset, DataLoader
 from refresh import extract_text_from_pdfs_and_txts
 from tqdm import tqdm 
+from torch.cuda.amp import autocast, GradScaler
 
 # =====================
 # 1. TOKENIZER SETUP
@@ -65,7 +66,7 @@ class TextDataset(Dataset):
 # 3. MODEL DEFINITION
 # =====================
 class NanoGPT(nn.Module):
-    def __init__(self, vocab_size, embed_size=256, n_layers=64, n_heads=8):
+    def __init__(self, vocab_size, embed_size=256, n_layers=32, n_heads=4):
         super().__init__()
         self.token_embed = nn.Embedding(vocab_size, embed_size)
         self.pos_embed = nn.Embedding(1024, embed_size)
@@ -120,12 +121,18 @@ def train_model(tokenizer, forModel="forModel"):
         print("ERROR: Not enough data to create even one training sample. "
               "Please check your PDF files or reduce seq_len.")
         return None
-    dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+    dataloader = DataLoader(dataset, batch_size=8, shuffle=True, num_workers=2)
 
     # Initialize model
     model = NanoGPT(vocab_size=tokenizer.get_vocab_size())
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=6e-4)
     loss_fn = nn.CrossEntropyLoss()
+
+    use_amp = torch.cuda.is_available()
+    if use_amp:
+        scaler = GradScaler()
 
     # Training loop
     model.train()
@@ -133,15 +140,22 @@ def train_model(tokenizer, forModel="forModel"):
         total_loss = 0
         batch_iter = tqdm(dataloader, desc=f"Epoch {epoch+1}", unit="batch")
         for batch in batch_iter:
-            inputs = batch["input_ids"]
-            targets = batch["labels"]
-
-            logits = model(inputs)
-            loss = loss_fn(logits.view(-1, logits.size(-1)), targets.view(-1))
+            inputs = batch["input_ids"].to(device)
+            targets = batch["labels"].to(device)
 
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            if use_amp:
+                with torch.amp.autocast(device_type='cuda'):
+                    logits = model(inputs)
+                    loss = loss_fn(logits.view(-1, logits.size(-1)), targets.view(-1))
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                logits = model(inputs)
+                loss = loss_fn(logits.view(-1, logits.size(-1)), targets.view(-1))
+                loss.backward()
+                optimizer.step()
 
             total_loss += loss.item()
             batch_iter.set_postfix(loss=loss.item())

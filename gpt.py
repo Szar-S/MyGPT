@@ -4,25 +4,10 @@ import torch.nn as nn
 from tokenizers import Tokenizer, decoders, pre_tokenizers, trainers, models
 import glob
 from torch.utils.data import Dataset, DataLoader
+from config import config
 from refresh import extract_text_from_pdfs_and_txts, create_tokenizer
 from tqdm import tqdm 
 from torch.cuda.amp import GradScaler
-
-config = {
-    "forModel": "forModel",
-    "forData": "data",
-    "modal_path": "gpt_model.pth",
-    "data_corpus": "data_corpus.txt",
-    "bpe_tokenizer": "bpe_tokenizer.json",
-    "vocab_size": 50257,         # int
-    "seq_len": 128,              # int
-    "batch_size": 8,             # int
-    "epochs": 3,                 # int
-    "learning_rate": 6e-4,       # float
-    "embed_size": 256,           # int
-    "n_layers": 32,              # int
-    "n_heads": 4                 # int
-}
 
 # =====================
 # 1. TOKENIZER SETUP

@@ -1,7 +1,7 @@
 import os
 import glob
 import PyPDF2
-from gpt import config
+from config import config
 from tokenizers import Tokenizer, models, pre_tokenizers, trainers, decoders
 
 def extract_text_from_pdfs_and_txts(folder=None, forModel=None):

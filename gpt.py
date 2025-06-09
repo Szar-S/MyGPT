@@ -36,6 +36,10 @@ class TextDataset(Dataset):
         self.tokenizer = tokenizer
         # Encode the entire text as token IDs
         self.tokens = tokenizer.encode(text).ids
+        # Add special tokens
+        bos_id = tokenizer.token_to_id("<bos>")
+        eos_id = tokenizer.token_to_id("<eos>")
+        self.tokens = [bos_id] + self.tokens + [eos_id]
         # Split into sequences of length seq_len
         self.seq_len = seq_len
         self.samples = []
@@ -67,7 +71,7 @@ class NanoGPT(nn.Module):
         
         # Transformer blocks
         self.blocks = nn.ModuleList([
-            nn.TransformerEncoderLayer(
+            nn.TransformerDecoderLayer(
                 d_model=embed_size,
                 nhead=n_heads,
                 dim_feedforward=4*embed_size,
@@ -206,7 +210,7 @@ def generate_text(model, tokenizer, prompt, max_length=50, temperature=0.8):
             probs = torch.softmax(next_logits, dim=-1)
             next_id = torch.multinomial(probs, num_samples=1).item()
         input_ids.append(next_id)
-        if next_id == eos_token_id:
+        if next_id == eos_token_id:  # Use eos_token_id for stopping
             break
 
     return tokenizer.decode(input_ids)

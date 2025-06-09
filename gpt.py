@@ -134,6 +134,23 @@ def train_model(tokenizer, forModel="forModel"):
     if use_amp:
         scaler = GradScaler()
 
+    # --- Training time estimation ---
+    import time
+    sample_batch = next(iter(dataloader))
+    inputs = sample_batch["input_ids"].to(device)
+    targets = sample_batch["labels"].to(device)
+    start_time = time.time()
+    with torch.no_grad():
+        logits = model(inputs)
+        loss = loss_fn(logits.view(-1, logits.size(-1)), targets.view(-1))
+    end_time = time.time()
+    batch_time = end_time - start_time
+    num_batches = len(dataloader)
+    epochs = 3
+    estimated_total = batch_time * num_batches * epochs
+    mins, secs = divmod(int(estimated_total), 60)
+    print(f"Estimated training time for {epochs} epochs: {mins} min {secs} sec")
+
     # Training loop
     model.train()
     for epoch in range(3):  # 3 epochs for demonstration

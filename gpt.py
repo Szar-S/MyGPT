@@ -134,15 +134,26 @@ def train_model(tokenizer, forModel="forModel"):
     if use_amp:
         scaler = GradScaler()
 
-    # --- Training time estimation ---
+    # --- Improved Training time estimation ---
     import time
     sample_batch = next(iter(dataloader))
     inputs = sample_batch["input_ids"].to(device)
     targets = sample_batch["labels"].to(device)
+    model.train()
     start_time = time.time()
-    with torch.no_grad():
+    optimizer.zero_grad()
+    if use_amp:
+        with torch.amp.autocast(device_type='cuda'):
+            logits = model(inputs)
+            loss = loss_fn(logits.view(-1, logits.size(-1)), targets.view(-1))
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+    else:
         logits = model(inputs)
         loss = loss_fn(logits.view(-1, logits.size(-1)), targets.view(-1))
+        loss.backward()
+        optimizer.step()
     end_time = time.time()
     batch_time = end_time - start_time
     num_batches = len(dataloader)

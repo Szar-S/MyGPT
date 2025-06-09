@@ -121,7 +121,7 @@ def train_model(tokenizer, forModel="forModel"):
         print("ERROR: Not enough data to create even one training sample. "
               "Please check your PDF files or reduce seq_len.")
         return None
-    dataloader = DataLoader(dataset, batch_size=8, shuffle=True, num_workers=2)
+    dataloader = DataLoader(dataset, batch_size=8, shuffle=True, num_workers=0)
 
     # Initialize model
     model = NanoGPT(vocab_size=tokenizer.get_vocab_size())
@@ -138,7 +138,7 @@ def train_model(tokenizer, forModel="forModel"):
     model.train()
     for epoch in range(3):  # 3 epochs for demonstration
         total_loss = 0
-        batch_iter = tqdm(dataloader, desc=f"Epoch {epoch+1}", unit="batch")
+        batch_iter = tqdm(dataloader, desc=f"Epoch {epoch+1}", unit="batch", leave=True, dynamic_ncols=True)
         for batch in batch_iter:
             inputs = batch["input_ids"].to(device)
             targets = batch["labels"].to(device)

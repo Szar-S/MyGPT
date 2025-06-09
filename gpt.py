@@ -118,7 +118,7 @@ def train_model(tokenizer, forModel="forModel"):
         with open(corpus_path, "r", encoding="utf-8") as f:
             text = f.read()
     dataset = TextDataset(text, tokenizer, seq_len=128)
-    if len(dataset) <= 30:
+    if len(dataset) <= 300:
         print("ERROR: Not enough data to create even one training sample. "
               "Please check your PDF files or reduce seq_len.")
         input("Press Enter to exit...")

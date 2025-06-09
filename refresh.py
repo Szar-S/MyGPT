@@ -48,7 +48,7 @@ def create_tokenizer(text, forModel="forModel"):
     tokenizer = Tokenizer(models.BPE())
     tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
     trainer = trainers.BpeTrainer(
-        vocab_size=2000,
+        vocab_size=10000,
         show_progress=True,
         special_tokens=["<unk>", "<pad>", "<bos>", "<eos>"]
     )

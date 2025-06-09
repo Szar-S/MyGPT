@@ -25,21 +25,20 @@ def extract_text_from_pdfs_and_txts(folder="data", forModel="forModel"):
                 for page in reader.pages:
                     page_text = page.extract_text()
                     if page_text:
-                        textAll += page_text + "\n"
+                        textAll += " ".join(page_text.split()) + "\n"
                 print(f"Processed PDF file: {filename}")
     if not glob.glob(txt_path):
         print("No TXT files found in 'data' directory.")
     else:
         for filename in glob.glob(txt_path):
             with open(filename, "r", encoding="utf-8") as f:
-                textAll += f.read() + "\n"
+                textAll += " ".join(f.read().split()) + "\n"
             print(f"Processed TXT file: {filename}")
-    textAll = " ".join(textAll.split())
     if not os.path.exists(data_corpus_path):
         print(f"Creating data corpus file at: {data_corpus_path}")
         os.makedirs(os.path.dirname(data_corpus_path), exist_ok=True)
     with open(data_corpus_path, "w", encoding="utf-8") as f:
-        f.write(" ".join(textAll.split()))
+        f.write(textAll)
     
     return textAll
     

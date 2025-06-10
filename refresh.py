@@ -29,27 +29,33 @@ def extract_text_from_pdfs_and_txts(folder=None, forModel=None):
         print("Processing PDF files...")
         for filename in pdf_Files:
             i = 1
-            print(f"Proccesing PDF File:{filename}")
-            with open(filename, "rb") as f:
-                reader = PyPDF2.PdfReader(f)
-                for page in reader.pages:
-                    page_text = page.extract_text()
-                    print(f"Proccesed the {i}. page")
-                    if page_text:
-                        textAll += page_text + " "
-                    i+= 1
-            print(f"Processed PDF file: {filename}")
+            try:
+                print(f"Proccesing PDF File:{filename}")
+                with open(filename, "rb") as f:
+                    reader = PyPDF2.PdfReader(f)
+                    for page in reader.pages:
+                        page_text = page.extract_text()
+                        print(f"Proccesed the {i}. page")
+                        if page_text:
+                            textAll += page_text + " "
+                        i+= 1
+                print(f"Processed PDF file: {filename}")
+            except Exception as e:
+                print(f"Error processing {filename}: {str(e)}")
+            
     
     if not txt_Files:
         print(f"No TXT files found in '{folder}' directory.")
     else:
         print(f"Found {len(txt_Files)} TXT files in '{folder}' directory.")
         print("Processing TXT files...")
-        
-        for filename in glob.glob(txt_path):
-            with open(filename, "r", encoding="utf-8") as f:
-                textAll += f.read() + " "
-            print(f"Processed TXT file: {filename}")
+        try:
+            for filename in glob.glob(txt_path):
+                with open(filename, "r", encoding="utf-8") as f:
+                    textAll += f.read() + " "
+                print(f"Processed TXT file: {filename}")
+        except Exception as e:
+            print(f"Error processing {filename}: {str(e)}")
     
     if textAll.strip():
         textAll = " ".join(textAll.split())
@@ -59,7 +65,7 @@ def extract_text_from_pdfs_and_txts(folder=None, forModel=None):
             os.makedirs(os.path.dirname(data_corpus_path), exist_ok=True)
         
         with open(data_corpus_path, "w", encoding="utf-8") as f:
-            f.write(textAll)
+            f.write(textAll.replace("�", ""))
         return textAll
     else:
         print("No text extracted from the provided files.")
@@ -69,7 +75,7 @@ def create_tokenizer(text, forModel=None):
     
     if forModel is None:
         forModel = config["forModel"]
-    
+        
     tokenizer_path = os.path.join(forModel, config["bpe_tokenizer"])
     os.makedirs(forModel, exist_ok=True)
     

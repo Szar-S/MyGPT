@@ -1,3 +1,4 @@
+import torch
 config = {
     "forModel": "forModel",
     "forData": "data",
@@ -26,5 +27,6 @@ config = {
     
     # System
     "use_ddp": False,            # bool
-    "num_workers": 4             #int
+    "num_workers": 4,            #int
+    "device": "cuda" if torch.cuda.is_available() else "cpu"
 }

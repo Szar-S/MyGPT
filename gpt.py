@@ -11,6 +11,7 @@ from tqdm import tqdm
 from torch.cuda.amp import GradScaler
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
+import sys
 
 # =====================
 # 1. TOKENIZER SETUP
@@ -129,16 +130,16 @@ class NanoGPT(nn.Module):
 # =====================
 def setup_ddp(rank, world_size):
     os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12345'
-    dist.init_process_group("nccl", rank=rank,world_size=world_size)
+    os.environ['MASTER_PORT'] = '12355'  # Changed port to avoid conflicts
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
 
-def train_model(tokenizer, rank=0, world_size=1, forModel=config["forModel"]):
-    if config["use_ddp"]:
+def train_model( tokenizer, rank = 0, world_size =0, forModel=config["forModel"], model=None):
+    if config["use_ddp"] and world_size > 1:
         setup_ddp(rank, world_size)
         device = rank
         torch.cuda.set_device(device)
     else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = torch.device(config["device"])
     
     corpus_path = os.path.join(forModel, config["data_corpus"])
     save_path = os.path.join(forModel, config["model_path"])
@@ -170,12 +171,14 @@ def train_model(tokenizer, rank=0, world_size=1, forModel=config["forModel"]):
     )
 
     # Initialize model
-    model = NanoGPT(
-        vocab_size=tokenizer.get_vocab_size(),
-        embed_size=config["embed_size"],
-        n_layers=config["n_layers"],
-        n_heads=config["n_heads"]
-    )
+    if model is None:
+        model = NanoGPT(
+            vocab_size=tokenizer.get_vocab_size(),
+            embed_size=config["embed_size"],
+            n_layers=config["n_layers"],
+            n_heads=config["n_heads"]
+        )
+    
     
     save_path = os.path.join(forModel, config["model_path"])
     if os.path.exists(save_path) and os.path.getsize(save_path) > 0:
@@ -307,47 +310,50 @@ def generate_text(model, tokenizer, prompt, max_length=config["max_length"], tem
 # MAIN EXECUTION
 # =====================
 def main():
-    # Initialize tokenizer (using your pre-trained BPE)
     tokenizer = initialize_tokenizer()
     model_path = os.path.join(config["forModel"], config["model_path"])
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
     model_exists = os.path.exists(model_path) and os.path.getsize(model_path) > 0
     use_ddp = config["use_ddp"] and torch.cuda.device_count() > 1
     
+    # Determine if we need to train
     if model_exists:
-        retrain = input("A trained model exists. Train again? (yes/no): ").lower().replace(" ", "")
-        while retrain != "yes" and retrain != "no":
-            retrain = input("Please enter yes or no: ").strip().lower()
+        retrain = input("Model exists. Retrain? (y/n): ").lower().strip()
+        retrain = retrain in ['y', 'yes']
     else:
-        retrain = "yes"
-     # Check if we should use distributed training
-     
-    if retrain == "yes":
-        print("Training model...")
+        retrain = True
+    
+    # Training logic
+    if retrain:
         if use_ddp:
-            torch.backends.cudnn.benchmark = True
-            # Start distributed training
+            world_size = torch.cuda.device_count()
             torch.multiprocessing.spawn(
                 train_model,
-                args=(tokenizer, torch.cuda.device_count()),
-                nprocs=torch.cuda.device_count(),
+                args=(world_size, tokenizer, config["forModel"], None),
+                nprocs=world_size,
                 join=True
             )
-            model = NanoGPT(vocab_size=tokenizer.get_vocab_size())
-            model.load_state_dict(torch.load(model_path))
         else:
-            # Single process training
-            model = train_model(tokenizer)
+            # Load existing model if available for continued training
+            model = None
+            if model_exists:
+                model = NanoGPT(vocab_size=tokenizer.get_vocab_size())
+                model.load_state_dict(torch.load(model_path, map_location=config["device"]))
+                model.to(config["device"])
+            train_model(tokenizer, rank=0, world_size=1, model=model)
+    
+    # Load model for generation (whether retrained or not)
+    model = NanoGPT(vocab_size=tokenizer.get_vocab_size())
+    model.load_state_dict(torch.load(model_path, map_location=config["device"]))
+    model.to(config["device"])
+    
+    # Compile for faster inference
+    if sys.platform != "win32":
+        try:
+            model = torch.compile(model)
+        except Exception as e:
+            print("Could not compile model. Using uncompiled version:", e)
     else:
-        print("Loading pre-trained model...")
-        model = NanoGPT(vocab_size=tokenizer.get_vocab_size())
-        model.load_state_dict(torch.load(model_path))
-    
-    # Do not use torch.compile if you do not have a C++ compiler
-    # model = torch.compile(model=model)
-    
-    model = model.to(device)
+        print("Skipping torch.compile on Windows (no cl.exe).")
     
     # Interactive generation
     print("\nGPT Ready! Type your prompt (or 'quit' to exit)")
@@ -355,7 +361,6 @@ def main():
         prompt = input("\nPrompt: ")
         if prompt.lower() in ["quit", "exit"]:
             break
-        
         response = generate_text(model, tokenizer, prompt)
         print(f"Generated: {response}")
 

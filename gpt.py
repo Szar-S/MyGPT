@@ -32,7 +32,17 @@ def initialize_tokenizer(forModel=None):
                 text = f.read()
         tokenizer = create_tokenizer(text)
     else:
-        tokenizer = Tokenizer.from_file(tokenizer_path)
+        try:
+            tokenizer = Tokenizer.from_file(tokenizer_path)
+        except Exception as e:
+            print(f"Error downlading tokenzier: {e}")
+            input("Hit enter to create a new one.")
+            if not os.path.exists(data_path) or os.path.getsize(data_path) == 0:    
+                text = extract_text_from_pdfs_and_txts()
+            else:
+                with open(data_path, "r", encoding="utf-8") as f:
+                    text = f.read()
+            tokenizer = create_tokenizer(text)
     
     tokenizer = Tokenizer.from_file(tokenizer_path)
     tokenizer.decoder = decoders.ByteLevel()
@@ -317,13 +327,18 @@ def main():
     
     # Determine if we need to train
     if model_exists:
-        retrain = input("Model exists. Retrain? (y/n): ").lower().strip()
-        retrain = retrain in ['y', 'yes']
+        retr = input("Model exists. Retrain? (y/n): ").lower().strip()
+        while retr != "y" and retr != "yes" and retr != "no" and retr != "n":
+            retr = input("please use yes(y) or no(n): ")
+        if retr == "y" or retr == "yes":
+            retrain = True
+        else:
+            retrain = False    
     else:
         retrain = True
     
     # Training logic
-    if retrain:
+    if retrain and model_exists:
         if use_ddp:
             world_size = torch.cuda.device_count()
             torch.multiprocessing.spawn(
@@ -334,12 +349,15 @@ def main():
             )
         else:
             # Load existing model if available for continued training
-            model = None
-            if model_exists:
-                model = NanoGPT(vocab_size=tokenizer.get_vocab_size())
-                model.load_state_dict(torch.load(model_path, map_location=config["device"]))
-                model.to(config["device"])
+            model = NanoGPT(vocab_size=tokenizer.get_vocab_size())
+            model.load_state_dict(torch.load(model_path, map_location=config["device"]))
+            model.to(config["device"])
             train_model(tokenizer, rank=0, world_size=1, model=model)
+            torch.save(model_path)
+    elif retrain and not model_exists:
+        model = None
+        train_model(tokenizer, rank=0, world_size=1, model=model)
+        torch.save(model_path)
     
     # Load model for generation (whether retrained or not)
     model = NanoGPT(vocab_size=tokenizer.get_vocab_size())

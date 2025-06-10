@@ -75,12 +75,14 @@ def create_tokenizer(text, forModel=None):
     
     if forModel is None:
         forModel = config["forModel"]
+    os.makedirs(forModel, exist_ok=True)
         
     tokenizer_path = os.path.join(forModel, config["bpe_tokenizer"])
-    os.makedirs(forModel, exist_ok=True)
-    
     tokenizer = Tokenizer(models.BPE())
     tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel()
+    if os.path.exists(tokenizer_path):
+        tokenizer.from_file(tokenizer_path)
+    
     trainer = trainers.BpeTrainer(
         vocab_size=config["vocab_size"],
         show_progress=True,

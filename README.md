@@ -10,6 +10,7 @@ A minimal, self-hosted GPT-style text generation model for local experimentation
 - Interactive text generation from the command line
 - Supports top-k and top-p (nucleus) sampling for generation
 - Distributed training (optional, via DDP)
+- Visual training progress with per-epoch and per-batch loss
 - Easy retraining and data refresh
 
 ## Setup
@@ -20,7 +21,7 @@ A minimal, self-hosted GPT-style text generation model for local experimentation
 2. **Install Requirements**  
    Install the required Python packages:
    ```sh
-   pip install torch tokenizers PyPDF2 tqdm
+   pip install torch tokenizers PyPDF2 tqdm numpy
    ```
 
 3. **First Run / Training**  
@@ -75,6 +76,13 @@ You can adjust:
 - Tokenizer settings (`vocab_size`)
 - Generation settings (`top_k`, `top_p`, `temperature`)
 - DDP usage (`use_ddp`)
+- DataLoader workers (`num_workers`)
+
+## Notes
+
+- Padding tokens are ignored in the loss calculation for more stable training.
+- The model and tokenizer are always kept in sync; if you refresh data or tokenizer, retrain the model.
+- Training and generation work on both CPU and GPU. DDP is supported for multi-GPU setups.
 
 ## License
 

@@ -1,4 +1,5 @@
 import os
+import numpy as np
 import torch
 import torch.nn as nn
 from tokenizers import Tokenizer, decoders
@@ -8,10 +9,9 @@ import torch.utils.data.distributed
 from config import config
 from refresh import extract_text_from_pdfs_and_txts, create_tokenizer
 from tqdm import tqdm 
-from torch.amp import GradScaler
+from torch.cuda.amp import GradScaler
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from tqdm import tqdm
 
 # =====================
 # 1. TOKENIZER SETUP
@@ -45,30 +45,44 @@ class TextDataset(Dataset):
         self.tokenizer = tokenizer
         self.seq_len = seq_len or config["seq_len"]
         self.corpus_path = os.path.join(config["forModel"],config["data_corpus"]) 
-        self.file_size = os.path.getsize(corpus_path)
+        
+        token_path = corpus_path + ".tokens"
+        if not os.path.exists(token_path) or os.path.getsize(token_path) == 0:
+            with open(corpus_path, "r", encoding="utf-8") as f:
+                tokens = tokenizer.encode(f.read()).ids
+                np.array(tokens, dtype=np.int32).tofile(token_path)
+        
+        self.tokens = np.memmap(
+            token_path,
+            dtype =np.int32,
+            mode = 'r'
+        )
+        
+        self.num_tokens = len(self.tokens)
         
         self.bos_id = tokenizer.token_to_id("<bos>")
         self.eos_id = tokenizer.token_to_id("<eos>")
         self.pad_id = tokenizer.token_to_id("<pad>")
     def __len__(self):
-        return max(1,self.file_size // (self.seq_len * 4))
+        return self.num_tokens // self.seq_len
     def __getitem__(self, idx):
         start_pos = idx * self.seq_len
-        with open(self.corpus_path, "rb") as f:
-            f.seek(start_pos)
-            raw_bytes = f.read(self.seq_len * 10)
-            text_chunk = raw_bytes.decode("utf-8", errors="replace")
-        tokens = [self.bos_id] + self.tokenizer.encode(text_chunk).ids
-        if len(tokens) < self.seq_len + 1:
-            tokens += [self.eos_id] + [self.pad_id] * (self.seq_len - len(tokens))
+        end_pos = start_pos + self.seq_len + 1
         
-        input_ids = tokens[:self.seq_len]
-        labels = tokens[1:self.seq_len + 1]
+        if end_pos > self.num_tokens:
+            pad_len = end_pos - self.num_tokens
+            chunk = np.pad(
+                self.tokens[start_pos:],
+                (0, pad_len),
+                constant_values=self.pad_id
+            )
+            chunk[self.num_tokens - start_pos -1] = self.eos_id
+        else:
+            chunk = self.tokens[start_pos:end_pos]
         return {
-            "input_ids": torch.tensor(input_ids, dtype=torch.long),
-            "labels": torch.tensor(labels, dtype=torch.long)
+            "input_ids": torch.tensor(chunk[:self.seq_len], dtype=torch.long),
+            "labels": torch.tensor(chunk[1:self.seq_len+1],dtype=torch.long)
         }
-
 # =====================
 # 3. MODEL DEFINITION
 # =====================
@@ -140,14 +154,14 @@ def train_model(tokenizer, rank=0, world_size=1, forModel=config["forModel"]):
     save_path = os.path.join(forModel, config["modal_path"])
     # Initialize dataset and dataloader
     if not os.path.exists(corpus_path) or os.path.getsize(corpus_path) == 0:
-        text = extract_text_from_pdfs_and_txts()
+        extract_text_from_pdfs_and_txts()
     else:
         with open(corpus_path, "r", encoding="utf-8") as f:
-            text = f.read()
+            pass
     
     dataset = TextDataset(corpus_path, tokenizer, config["seq_len"])
     sampler = torch.utils.data.distributed.DistributedSampler(
-        dataset, num_replicas=world_size,rank=rank
+        dataset, num_replicas=world_size, rank=rank
     ) if config["use_ddp"] else None
     
     if len(dataset) <= 300:
@@ -161,7 +175,8 @@ def train_model(tokenizer, rank=0, world_size=1, forModel=config["forModel"]):
         batch_size=config["batch_size"],
         sampler=sampler,
         shuffle=(sampler is None),
-        num_workers= 0
+        num_workers= config["num_workers"],
+        persistent_workers=True
     )
 
     # Initialize model
@@ -179,7 +194,7 @@ def train_model(tokenizer, rank=0, world_size=1, forModel=config["forModel"]):
     optimizer = torch.optim.AdamW(model.parameters(), lr=config["learning_rate"])
     scaler = GradScaler('cuda') if torch.cuda.is_available() else None
     
-    loss_fn = nn.CrossEntropyLoss()
+    loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer.token_to_id("<pad>"))
     model.train()
 
     # Epoch progress bar
@@ -299,6 +314,7 @@ def main():
     if not os.path.exists(model_path) or os.path.getsize(model_path) == 0:
         print("Training model...")
         if use_ddp:
+            torch.backends.cudnn.benchmark = True
             # Start distributed training
             torch.multiprocessing.spawn(
                 train_model,
@@ -315,6 +331,8 @@ def main():
         print("Loading pre-trained model...")
         model = NanoGPT(vocab_size=tokenizer.get_vocab_size())
         model.load_state_dict(torch.load(model_path))
+    
+    model = torch.compile(model=model)
     
     model = model.to("cuda" if torch.cuda.is_available() else "cpu")
     

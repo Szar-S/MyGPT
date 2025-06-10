@@ -1,6 +1,7 @@
 import os
 import glob
 import PyPDF2
+import numpy as np
 from config import config
 from tokenizers import Tokenizer, models, pre_tokenizers, trainers, decoders
 
@@ -84,11 +85,26 @@ def create_tokenizer(text, forModel=None):
     tokenizer.save(tokenizer_path)
     return tokenizer
 
+def token_save(tokenizer, corpus_path):
+    token_path = corpus_path + ".tokens"
+    if not os.path.exists(token_path) or os.path.getsize(token_path) == 0:
+        with open(corpus_path, "r", encoding="utf-8") as f:
+            tokens = tokenizer.encode(f.read()).ids
+            np.array(tokens, dtype=np.int32).tofile(token_path)
+    tokens = np.memmap(
+        token_path,
+        dtype =np.int32,
+        mode = 'r'
+    )
+    return tokens
+
 if __name__ == "__main__":
     # Extract text from PDFs and TXT files
     textAll = extract_text_from_pdfs_and_txts()
     if textAll:
-        create_tokenizer(textAll)
+        tokenizer = create_tokenizer(textAll)
+        token_save(tokenizer,corpus_path=os.path.join(config["forModel"], config["data_corpus"]))
+        
         print(f"Text extraction complete. Data saved to '{config['forModel']}/{config['data_corpus']}'.")
     else:
         print("No text extracted. Please check your files.")

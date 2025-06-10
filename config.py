@@ -4,17 +4,26 @@ config = {
     "modal_path": "gpt_model.pth",
     "data_corpus": "data_corpus.txt",
     "bpe_tokenizer": "bpe_tokenizer.json",
+    "min_data_size": 300,        # int
     
-    "vocab_size": 50257,         # int
-    "seq_len": 32,              # int
-    "batch_size": 32,             # int
-    "epochs": 8,                 # int
+    # Model Architecture 
+    "vocab_size": 10000,         # int
+    "embed_size": 192,           # int
+    "n_layers": 6,              # int
+    "n_heads": 6,                # int
+    
+    # Training Parameters
+    "seq_len": 128,              # int
+    "batch_size": 64,             # int
+    "epochs": 15,                 # int
     "learning_rate": 6e-4,       # float
-    "embed_size": 256,           # int
-    "n_layers": 32,              # int
-    "n_heads": 8,                # int
+    
+    # Generation Settings
+    "top_k": 40,                 # int
+    "top_p": 0.85,                # float
+    "temperature": 0.7,           # float
+    
+    # System
     "use_ddp": False,            # bool
-    "top_k": 50,                 # int
-    "top_p": 0.9,                # float
-    "temperature": 0.8           # float
+    "num_workers": 4             #int
 }

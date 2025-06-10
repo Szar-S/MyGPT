@@ -74,14 +74,14 @@ def create_tokenizer(text, forModel=None):
     os.makedirs(forModel, exist_ok=True)
     
     tokenizer = Tokenizer(models.BPE())
-    tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
+    tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel()
     trainer = trainers.BpeTrainer(
         vocab_size=config["vocab_size"],
         show_progress=True,
         special_tokens=["<unk>", "<pad>", "<bos>", "<eos>"]
     )
     tokenizer.train_from_iterator([text], trainer)
-    tokenizer.decoder = decoders.BPEDecoder()
+    tokenizer.decoder = decoders.ByteLevel()
     tokenizer.save(tokenizer_path)
     return tokenizer
 

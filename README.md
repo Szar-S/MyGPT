@@ -5,12 +5,13 @@ A minimal, self-hosted GPT-style text generation model for local experimentation
 ## Features
 
 - Extracts text from PDFs and TXT files in the `data/` directory
-- Trains a Byte-Pair Encoding (BPE) tokenizer using the `tokenizers` library
+- Trains a Byte-Pair Encoding (BPE) tokenizer using the `tokenizers` library (with ByteLevel for proper spacing)
 - Implements a simple GPT-like transformer model in PyTorch
 - Interactive text generation from the command line
 - Supports top-k and top-p (nucleus) sampling for generation
 - Distributed training (optional, via DDP)
 - Visual training progress with per-epoch and per-batch loss
+- Ignores padding tokens in loss for stable training
 - Easy retraining and data refresh
 
 ## Setup
@@ -62,7 +63,7 @@ If you add new data files or remove old ones:
 ## File Structure
 
 - `gpt.py` — Main script: model, training, and generation loop
-- `refresh.py` — Extracts text from PDFs/TXT and (re)trains the tokenizer
+- `refresh.py` — Extracts text from PDFs/TXT and (re)trains the tokenizer (uses ByteLevel for proper spacing)
 - `config.py` — Configuration dictionary for paths and hyperparameters
 - `forModel/` — Stores the trained model and tokenizer
 - `data/` — Place your source `.pdf` and `.txt` files here
@@ -83,6 +84,7 @@ You can adjust:
 - Padding tokens are ignored in the loss calculation for more stable training.
 - The model and tokenizer are always kept in sync; if you refresh data or tokenizer, retrain the model.
 - Training and generation work on both CPU and GPU. DDP is supported for multi-GPU setups.
+- The tokenizer uses ByteLevel pre-tokenizer and decoder for correct spacing in generated text.
 
 ## License
 

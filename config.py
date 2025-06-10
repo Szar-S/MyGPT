@@ -6,19 +6,21 @@ config = {
     "data_corpus": "data_corpus.txt",
     "bpe_tokenizer": "bpe_tokenizer.json",
     "min_data_size": 300,        # int
-    "max_length": 50,            # int
+    "max_length": 200,            # int
     
     # Model Architecture 
     "vocab_size": 10000,         # int
-    "embed_size": 192,           # int
+    "embed_size": 216,           # int
     "n_layers": 6,              # int
     "n_heads": 6,                # int
     
     # Training Parameters
-    "seq_len": 128,              # int
-    "batch_size": 64,             # int
+    "seq_len": 256,              # int
+    "start_seq_len": 32,
+    "batch_size": 8,             # int
     "epochs": 15,                 # int
-    "learning_rate": 3e-4,       # float
+    "seq_len_double_interval":5,
+    "learning_rate": 2e-4,       # float
     
     # Generation Settings
     "top_k": 40,                 # int

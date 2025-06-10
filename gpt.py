@@ -161,24 +161,12 @@ def train_model( tokenizer, rank = 0, world_size =0, forModel=config["forModel"]
             pass
     
     dataset = TextDataset(corpus_path, tokenizer, config["seq_len"])
-    sampler = torch.utils.data.distributed.DistributedSampler(
-        dataset, num_replicas=world_size, rank=rank
-    ) if config["use_ddp"] else None
-    
     if len(dataset) <= 300:
         print("ERROR: Not enough data to create even one training sample. "
               "Please check your PDF files or reduce seq_len.")
         input("Press Enter to exit...")
         return None
     
-    dataloader = DataLoader(
-        dataset,
-        batch_size=config["batch_size"],
-        sampler=sampler,
-        shuffle=(sampler is None),
-        num_workers= config["num_workers"],
-        persistent_workers=True
-    )
 
     # Initialize model
     if model is None:
@@ -210,9 +198,85 @@ def train_model( tokenizer, rank = 0, world_size =0, forModel=config["forModel"]
     
     loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer.token_to_id("<pad>"))
     model.train()
+    
+    start_seq_len = config["start_seq_len"]
+    seq_len_double_interval = config["seq_len_double_interval"]
+    current_seq_len = start_seq_len
+    
+    original_seq_len = config["seq_len"]
+    original_epochs = config["epochs"]
+    
+    global_epoch = 0
+    total_epochs = config["epochs"]
 
     # Epoch progress bar
     epoch_bar = tqdm(range(config["epochs"]), desc="Epochs", position=0)
+    
+    while global_epoch < original_epochs:
+        if global_epoch > 0 and global_epoch % seq_len_double_interval == 0:
+            current_seq_len = min(current_seq_len * 2, original_seq_len)
+            print(f"Epoch {global_epoch}: sequence length at {current_seq_len}")
+        
+        dataset = TextDataset(corpus_path, tokenizer, current_seq_len)
+        sampler = torch.utils.data.distributed.DistributedSampler(
+            dataset, num_replicas=world_size, rank=rank
+        ) if config["use_ddp"] else None
+        
+        dataloader = DataLoader(
+            dataset,
+            batch_size=config["batch_size"],
+            sampler=sampler,
+            shuffle=(sampler is None),
+            num_workers=config["num_workers"],
+            persistent_workers=True
+        )
+        if sampler:
+            sampler.set_epoch(global_epoch)
+        total_loss = 0
+        batch_bar = tqdm(dataloader, desc=f"Epoch {global_epoch+1}/{total_epochs}", position=1, leave=False)
+        
+        for batch in batch_bar:
+            inputs = batch["input_ids"].to(device)
+            targets = batch["labels"].to(device)
+
+            optimizer.zero_grad()
+            if scaler:
+                with torch.amp.autocast('cuda'):
+                    logits = model(inputs)
+                    loss = loss_fn(
+                        logits.view(-1, logits.size(-1)),
+                        targets.view(-1)
+                    )
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                logits = model(inputs)
+                loss = loss_fn(
+                    logits.view(-1, logits.size(-1)), 
+                    targets.view(-1)
+                )
+                loss.backward()
+                optimizer.step()
+            
+            total_loss += loss.item()
+            batch_bar.set_postfix(
+                loss=loss.item(), 
+                avg_loss=total_loss/(batch_bar.n+1),
+                seq_len=current_seq_len
+            )
+        
+        if rank == 0:
+            epoch_bar.update(1)
+            epoch_bar.set_postfix(
+                avg_loss=total_loss/len(dataloader),
+                seq_len=current_seq_len
+            )
+            print(f"Epoch {global_epoch+1} | Loss: {total_loss/len(dataloader):.4f} | Seq Len: {current_seq_len}")
+        
+        global_epoch += 1
+        
+    """ #If every epoch same 
     for epoch in epoch_bar:
         if sampler:
             sampler.set_epoch(epoch)
@@ -246,6 +310,7 @@ def train_model( tokenizer, rank = 0, world_size =0, forModel=config["forModel"]
         if rank == 0:
             epoch_bar.set_postfix(avg_epoch_loss=total_loss/len(dataloader))
             print(f"Epoch {epoch+1} | Loss: {total_loss/len(dataloader):.4f}")
+    """
     
     if rank == 0:
         save_path = os.path.join(config["forModel"], config["model_path"])

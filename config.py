@@ -21,6 +21,8 @@ config = {
     "epochs": 15,                 # int
     "seq_len_double_interval":5,
     "learning_rate": 2e-4,       # float
+    "gradient_accumulation_steps": 4,
+    "learning_rate_decay": 0.95,
     
     # Generation Settings
     "top_k": 40,                 # int

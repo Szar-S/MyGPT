@@ -56,7 +56,7 @@ def extract_text_from_pdfs_and_txts(folder=None, forModel=None):
                 print(f"Processed TXT file: {filename}")
         except Exception as e:
             print(f"Error processing {filename}: {str(e)}")
-    
+    textAll = textAll.replace("�", "").replace("---", " ").replace("--","").replace("   ", " ").replace("  ", " ")
     if textAll.strip():
         textAll = " ".join(textAll.split())
         
@@ -65,7 +65,7 @@ def extract_text_from_pdfs_and_txts(folder=None, forModel=None):
             os.makedirs(os.path.dirname(data_corpus_path), exist_ok=True)
         
         with open(data_corpus_path, "w", encoding="utf-8") as f:
-            f.write(textAll.replace("�", ""))
+            f.write(textAll)
         return textAll
     else:
         print("No text extracted from the provided files.")
@@ -95,16 +95,26 @@ def create_tokenizer(text, forModel=None):
 
 def token_save(tokenizer, corpus_path):
     token_path = corpus_path + ".tokens"
-    if not os.path.exists(token_path) or os.path.getsize(token_path) == 0:
+    corpus_mtime = os.path.getmtime(corpus_path) if os.path.exists(corpus_path) else 0
+    
+    # Check if we need to re-tokenize
+    if (not os.path.exists(token_path) or 
+        os.path.getsize(token_path) == 0 or
+        (os.path.exists(token_path) and os.path.getmtime(token_path) < corpus_mtime)):
+        
+        # Read and tokenize corpus
         with open(corpus_path, "r", encoding="utf-8") as f:
             tokens = tokenizer.encode(f.read()).ids
-            np.array(tokens, dtype=np.int32).tofile(token_path)
-    tokens = np.memmap(
+        
+        # Save tokens as memory-mapped file
+        np.array(tokens, dtype=np.int32).tofile(token_path)
+    
+    # Load tokens from memory-mapped file
+    return np.memmap(
         token_path,
-        dtype =np.int32,
-        mode = 'r'
+        dtype=np.int32,
+        mode='r'
     )
-    return tokens
 
 if __name__ == "__main__":
     # Extract text from PDFs and TXT files
@@ -112,7 +122,6 @@ if __name__ == "__main__":
     if textAll:
         tokenizer = create_tokenizer(textAll)
         token_save(tokenizer,corpus_path=os.path.join(config["forModel"], config["data_corpus"]))
-        
         print(f"Text extraction complete. Data saved to '{config['forModel']}/{config['data_corpus']}'.")
     else:
         print("No text extracted. Please check your files.")

@@ -196,6 +196,12 @@ def train_model( tokenizer, rank = 0, world_size =0, forModel=config["forModel"]
     optimizer = torch.optim.AdamW(model.parameters(), lr=config["learning_rate"])
     scaler = GradScaler('cuda') if torch.cuda.is_available() else None
     
+    accumulation_steps = config["gradient_accumulation_steps"]
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(
+        optimizer,
+        gamma=config["learning_rate_decay"]
+    )
+    
     loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer.token_to_id("<pad>"))
     model.train()
     
@@ -233,46 +239,63 @@ def train_model( tokenizer, rank = 0, world_size =0, forModel=config["forModel"]
         if sampler:
             sampler.set_epoch(global_epoch)
         total_loss = 0
-        batch_bar = tqdm(dataloader, desc=f"Epoch {global_epoch+1}/{total_epochs}", position=1, leave=False)
+        accumulation_counter = 0
+        batch_bar = tqdm(enumerate(dataloader), total=len(dataloader),
+                        desc=f"Epoch {global_epoch+1}/{total_epochs}",
+                        position=1, leave=False
+                        )
         
-        for batch in batch_bar:
+        optimizer.zero_grad()
+        
+        for batch_idx, batch in batch_bar:
             inputs = batch["input_ids"].to(device)
             targets = batch["labels"].to(device)
-
-            optimizer.zero_grad()
+            
             if scaler:
                 with torch.amp.autocast('cuda'):
                     logits = model(inputs)
                     loss = loss_fn(
                         logits.view(-1, logits.size(-1)),
                         targets.view(-1)
-                    )
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
+                    ) / accumulation_steps
             else:
                 logits = model(inputs)
                 loss = loss_fn(
                     logits.view(-1, logits.size(-1)), 
                     targets.view(-1)
-                )
-                loss.backward()
-                optimizer.step()
+                ) / accumulation_steps
             
-            total_loss += loss.item()
+            if scaler:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
+            accumulation_counter += 1
+            total_loss += loss.item() * accumulation_steps
+            
+            if accumulation_counter % accumulation_steps == 0:
+                if scaler:
+                    scaler.step(optimizer)
+                    scaler.update
+                else:
+                    optimizer.step()
+                optimizer.zero_grad()
+            
             batch_bar.set_postfix(
-                loss=loss.item(), 
-                avg_loss=total_loss/(batch_bar.n+1),
+                loss=loss.item() * accumulation_steps, 
+                avg_loss=total_loss/(batch_idx+1),
                 seq_len=current_seq_len
             )
+            
+        scheduler.step()
         
         if rank == 0:
             epoch_bar.update(1)
             epoch_bar.set_postfix(
                 avg_loss=total_loss/len(dataloader),
-                seq_len=current_seq_len
+                seq_len=current_seq_len,
+                lr= scheduler.get_last_lr()[0]
             )
-            print(f"Epoch {global_epoch+1} | Loss: {total_loss/len(dataloader):.4f} | Seq Len: {current_seq_len}")
+            print(f"Epoch {global_epoch+1} | Loss: {total_loss/len(dataloader):.4f} | Seq Len: {current_seq_len} | LR: {scheduler.get_last_lr()[0]:.7f}")
         
         global_epoch += 1
         
@@ -427,8 +450,10 @@ def main():
     # Load model for generation (whether retrained or not)
     model = NanoGPT(vocab_size=tokenizer.get_vocab_size())
     model.load_state_dict(torch.load(model_path, map_location=config["device"]))
-    model.to(config["device"])
-    
+    try:
+        model.to(config["device"])
+    except Exception as e:
+        print(f"A error: {e}")
     # Compile for faster inference
     if sys.platform != "win32":
         try:

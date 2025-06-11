@@ -98,7 +98,7 @@ class NanoGPT(nn.Module):
             n_heads = config["n_heads"]
         
         self.token_embed = nn.Embedding(vocab_size, embed_size)
-        self.pos_embed = nn.Embedding(1024, embed_size)
+        self.pos_embed = nn.Embedding(config["seq_len"], embed_size)
         
         # Use TransformerEncoderLayer for GPT-style model
         self.blocks = nn.ModuleList([
@@ -110,6 +110,7 @@ class NanoGPT(nn.Module):
             ) for _ in range(n_layers)
         ])
         
+        self.ln_pre = nn.LayerNorm(embed_size)
         self.ln_final = nn.LayerNorm(embed_size)
         self.lm_head = nn.Linear(embed_size, vocab_size)
     
@@ -125,8 +126,13 @@ class NanoGPT(nn.Module):
         pos_embeds = self.pos_embed(pos_ids)
         x = token_embeds + pos_embeds
         
+        for block in self.blocks:
+            x = self.ln_pre(x)
+            x = block(x, src_mask = mask)
+        
         # Apply causal mask for autoregressive behavior
-        mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1).bool()
+        #mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1).bool()
+        mask = nn.Transformer.generate_square_subsequent_mask(seq_len).to(device=device)
         
         # Process through transformer blocks
         for block in self.blocks:
@@ -137,7 +143,7 @@ class NanoGPT(nn.Module):
 
 # =====================
 # 4. TRAINING FUNCTION
-# =====================
+# ====================
 def setup_ddp(rank, world_size):
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'  # Changed port to avoid conflicts
@@ -197,9 +203,10 @@ def train_model( tokenizer, rank = 0, world_size =0, forModel=config["forModel"]
     scaler = GradScaler('cuda') if torch.cuda.is_available() else None
     
     accumulation_steps = config["gradient_accumulation_steps"]
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
-        gamma=config["learning_rate_decay"]
+        T_max=config["learning_rate_decay"],
+        eta_min=config["learning_rate"] / 10
     )
     
     loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer.token_to_id("<pad>"))
@@ -223,7 +230,8 @@ def train_model( tokenizer, rank = 0, world_size =0, forModel=config["forModel"]
             current_seq_len = min(current_seq_len * 2, original_seq_len)
             print(f"Epoch {global_epoch}: sequence length at {current_seq_len}")
         
-        dataset = TextDataset(corpus_path, tokenizer, current_seq_len)
+        dataset.seq_len = current_seq_len
+        
         sampler = torch.utils.data.distributed.DistributedSampler(
             dataset, num_replicas=world_size, rank=rank
         ) if config["use_ddp"] else None
@@ -275,7 +283,7 @@ def train_model( tokenizer, rank = 0, world_size =0, forModel=config["forModel"]
             if accumulation_counter % accumulation_steps == 0:
                 if scaler:
                     scaler.step(optimizer)
-                    scaler.update
+                    scaler.update()
                 else:
                     optimizer.step()
                 optimizer.zero_grad()

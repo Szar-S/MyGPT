@@ -148,7 +148,7 @@ class NanoGPT(nn.Module):
         return self.lm_head(x)
 
 # =====================
-# 4. TRAINING FUNCTION (WITH DYNAMIC EPOCH EXTENSION)
+# 4. TRAINING FUNCTION
 # ====================
 def setup_ddp(rank, world_size):
     os.environ['MASTER_ADDR'] = 'localhost'
@@ -312,7 +312,7 @@ def train_model(rank, tokenizer, world_size=0, forModel=config["forModel"], mode
             inputs = batch["input_ids"].to(device)
             targets = batch["labels"].to(device)
             
-            with torch.cuda.amp.autocast(enabled=(device.type == 'cuda')):
+            with torch.amp.autocast(device_type=device.type,enabled=(device.type == 'cuda')):
                 logits = model(inputs)
                 loss = loss_fn(
                     logits.view(-1, logits.size(-1)),

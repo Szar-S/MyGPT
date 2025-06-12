@@ -135,7 +135,7 @@ class NanoGPT(nn.Module):
         return self.lm_head(x)
 
 # =====================
-# 4. TRAINING FUNCTION (WITH EXTENDED EPOCHS)
+# 4. TRAINING FUNCTION
 # ====================
 def setup_ddp(rank, world_size):
     os.environ['MASTER_ADDR'] = 'localhost'
@@ -179,15 +179,20 @@ def train_model(rank, tokenizer, world_size=0, forModel=config["forModel"], mode
     
     
     save_path = os.path.join(forModel, config["model_path"])
+    
+    # Load model if it exists
     if os.path.exists(save_path) and os.path.getsize(save_path) > 0:
         try:
             state_dict = torch.load(save_path, map_location=device)
             if rank == 0:
                 print("Resuming training from existing model weights")
             model.load_state_dict(state_dict)
-        except:
+        except Exception as e:
             if rank == 0:
-                print("Couldn't load existing weights. Training from scratch")
+                print(f"Couldn't load existing weights: {e}. Training from scratch")
+    else:
+        if rank == 0:
+            print("No existing model found. Training from scratch")
             
     model = model.to(device)
     
@@ -407,12 +412,9 @@ def main():
     # Determine if we need to train
     if model_exists:
         retr = input("Model exists. Retrain? (y/n): ").lower().strip()
-        while retr != "y" and retr != "yes" and retr != "no" and retr != "n":
-            retr = input("please use yes(y) or no(n): ")
-        if retr == "y" or retr == "yes":
-            retrain = True
-        else:
-            retrain = False    
+        while retr not in ["y", "yes", "n", "no"]:
+            retr = input("Please use yes(y) or no(n): ")
+        retrain = (retr in ["y", "yes"])
     else:
         retrain = True
     
@@ -422,20 +424,19 @@ def main():
             world_size = torch.cuda.device_count()
             torch.multiprocessing.spawn(
                 train_model,
-                args=(tokenizer, world_size, config["forModel"], None),
+                args=(tokenizer, world_size, config["forModel"]),
                 nprocs=world_size,
                 join=True
             )
         else:
-            train_model(0, tokenizer, world_size=1, model=None)
+            train_model(0, tokenizer, world_size=1)
     
-    # Load model for generation (whether retrained or not)
+    # Load model for generation
     model = NanoGPT(vocab_size=tokenizer.get_vocab_size())
-    model.load_state_dict(torch.load(model_path, map_location=config["device"]))
-    try:
-        model.to(config["device"])
-    except Exception as e:
-        print(f"A error: {e}")
+    
+    if os.path.exists(model_path) and os.path.getsize(model_path) > 0:
+        model.load_state_dict(torch.load(model_path, map_location=config["device"]))
+    model.to(config["device"])
     
     # Compile for faster inference
     if sys.platform != "win32":

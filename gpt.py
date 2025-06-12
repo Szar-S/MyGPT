@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 from tokenizers import Tokenizer, decoders
 import glob
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
 import torch.utils.data.distributed
 from config import config
 from refresh import extract_text_from_pdfs_and_txts, create_tokenizer, token_save
@@ -34,7 +34,7 @@ def initialize_tokenizer(forModel=None):
         try:
             tokenizer = Tokenizer.from_file(tokenizer_path)
         except Exception as e:
-            print(f"Error downlading tokenzier: {e}")
+            print(f"Error loading tokenizer: {e}")
             input("Hit enter to create a new one.")
             if not os.path.exists(data_path) or os.path.getsize(data_path) == 0:    
                 text = extract_text_from_pdfs_and_txts()
@@ -51,12 +51,20 @@ def initialize_tokenizer(forModel=None):
 # 2. DATASET HANDLING
 # =====================
 class TextDataset(Dataset):
-    def __init__(self, corpus_path, tokenizer, seq_len=None):
+    def __init__(self, corpus_path, tokenizer, seq_len=None, split='train'):
         self.tokenizer = tokenizer
         self.seq_len = seq_len or config["seq_len"]
         self.corpus_path = os.path.join(config["forModel"], config["data_corpus"])
         
         self.tokens = token_save(tokenizer, corpus_path)
+        self.num_tokens = len(self.tokens)
+        
+        # Split dataset (90% train, 10% validation)
+        split_idx = int(0.9 * self.num_tokens)
+        if split == 'train':
+            self.tokens = self.tokens[:split_idx]
+        else:  # 'val'
+            self.tokens = self.tokens[split_idx:]
         self.num_tokens = len(self.tokens)
         
         self.bos_id = tokenizer.token_to_id("<bos>")
@@ -83,6 +91,7 @@ class TextDataset(Dataset):
             "input_ids": torch.tensor(chunk[:self.seq_len], dtype=torch.long),
             "labels": torch.tensor(chunk[1:self.seq_len+1], dtype=torch.long)
         }
+
 # =====================
 # 3. MODEL DEFINITION
 # =====================
@@ -96,15 +105,19 @@ class NanoGPT(nn.Module):
         if n_heads is None:
             n_heads = config["n_heads"]
         
+        # Use dropout from config with default 0.0 for backward compatibility
+        dropout_rate = config.get("dropout_rate", 0.0)
+        
         self.token_embed = nn.Embedding(vocab_size, embed_size)
         self.pos_embed = nn.Embedding(config["seq_len"], embed_size)
         
-        # Use TransformerEncoderLayer for GPT-style model
+        # Add dropout to transformer layers
         self.blocks = nn.ModuleList([
             nn.TransformerEncoderLayer(
                 d_model=embed_size,
                 nhead=n_heads,
                 dim_feedforward=4*embed_size,
+                dropout=dropout_rate,  # ADDED DROPOUT
                 batch_first=True
             ) for _ in range(n_layers)
         ])
@@ -139,34 +152,46 @@ class NanoGPT(nn.Module):
 # ====================
 def setup_ddp(rank, world_size):
     os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'  # Changed port to avoid conflicts
+    os.environ['MASTER_PORT'] = '12355'
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
+
+def evaluate(model, val_loader, loss_fn, device, rank):
+    """Run validation on the model"""
+    model.eval()
+    total_val_loss = 0.0
+    with torch.no_grad():
+        for batch in val_loader:
+            inputs = batch["input_ids"].to(device)
+            targets = batch["labels"].to(device)
+            logits = model(inputs)
+            loss = loss_fn(logits.view(-1, logits.size(-1)), targets.view(-1))
+            total_val_loss += loss.item()
+    avg_val_loss = total_val_loss / len(val_loader)
+    model.train()
+    return avg_val_loss
 
 def train_model(rank, tokenizer, world_size=0, forModel=config["forModel"], model=None):
     if config["use_ddp"] and world_size > 1:
         setup_ddp(rank, world_size)
         device = rank
         torch.cuda.set_device(device)
-        print(torch.version.cuda)
     else:
         device = torch.device(config["device"])
     
     corpus_path = os.path.join(forModel, config["data_corpus"])
     save_path = os.path.join(forModel, config["model_path"])
-    # Initialize dataset and dataloader
+    
+    # Initialize datasets
     if not os.path.exists(corpus_path) or os.path.getsize(corpus_path) == 0:
         extract_text_from_pdfs_and_txts()
-    else:
-        with open(corpus_path, "r", encoding="utf-8") as f:
-            pass
     
-    dataset = TextDataset(corpus_path, tokenizer, config["seq_len"])
-    if len(dataset) <= 300:
-        print("ERROR: Not enough data to create even one training sample. "
-              "Please check your PDF files or reduce seq_len.")
+    train_dataset = TextDataset(corpus_path, tokenizer, config["seq_len"], split='train')
+    val_dataset = TextDataset(corpus_path, tokenizer, config["seq_len"], split='val')
+    
+    if len(train_dataset) <= 300:
+        print("ERROR: Not enough data to create training samples.")
         input("Press Enter to exit...")
         return None
-    
 
     # Initialize model
     if model is None:
@@ -177,33 +202,29 @@ def train_model(rank, tokenizer, world_size=0, forModel=config["forModel"], mode
             n_heads=config["n_heads"]
         )
     
-    
-    save_path = os.path.join(forModel, config["model_path"])
-    
-    # Load model if it exists
+    # Load existing weights if available
     if os.path.exists(save_path) and os.path.getsize(save_path) > 0:
         try:
             state_dict = torch.load(save_path, map_location=device)
             if rank == 0:
                 print("Resuming training from existing model weights")
             model.load_state_dict(state_dict)
-        except Exception as e:
+        except:
             if rank == 0:
-                print(f"Couldn't load existing weights: {e}. Training from scratch")
-    else:
-        if rank == 0:
-            print("No existing model found. Training from scratch")
+                print("Couldn't load existing weights. Training from scratch")
             
     model = model.to(device)
     
     if config["use_ddp"] and world_size > 1:
         model = DDP(model, device_ids=[rank])
-    try:
-        optimizer = torch.optim.AdamW(model.parameters(), lr=config["learning_rate"])
-        scaler = torch.GradScaler(config["device"])
-    except Exception as e: 
-        print(f"error: {e}")
-        scaler = None
+    
+    # Add weight decay (default 0.01 if not in config)
+    weight_decay = config.get("weight_decay", 0.01)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), 
+        lr=config["learning_rate"],
+        weight_decay=weight_decay  # ADDED WEIGHT DECAY
+    )
     
     accumulation_steps = config["gradient_accumulation_steps"]
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -215,48 +236,73 @@ def train_model(rank, tokenizer, world_size=0, forModel=config["forModel"], mode
     loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer.token_to_id("<pad>"))
     model.train()
     
+    # Curriculum learning setup
     start_seq_len = config["start_seq_len"]
     seq_len_double_interval = config["seq_len_double_interval"]
     current_seq_len = start_seq_len
-    
     original_seq_len = config["seq_len"]
-    original_epochs = config["epochs"]
+    total_epochs = config["epochs"]
     
+    # Training state tracking
     global_epoch = 0
-    total_epochs = original_epochs  # Start with config epochs
+    best_val_loss = float('inf')
+    epochs_no_improve = 0
+    patience = config.get("patience", 3)  # Default 3 epochs patience
+    warmup_epochs = config.get("warmup_epochs", 2)  # Default 2 epoch warmup
+    
+    # Create validation dataloader (only needed for rank 0)
+    val_loader = None
+    if rank == 0:
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=config["batch_size"],
+            shuffle=False,
+            num_workers=config["num_workers"]
+        )
     
     # Epoch progress bar
     epoch_bar = tqdm(range(total_epochs), desc="Epochs", position=0)
-    early_stop = False
     
-    while global_epoch < total_epochs and not early_stop:
+    for global_epoch in range(total_epochs):
+        # Learning rate warmup
+        if global_epoch < warmup_epochs:
+            warmup_factor = 0.1 + 0.9 * global_epoch / warmup_epochs
+            for pg in optimizer.param_groups:
+                pg['lr'] = config["learning_rate"] * warmup_factor
+        
+        # Update sequence length for curriculum learning
         if global_epoch > 0 and global_epoch % seq_len_double_interval == 0:
             current_seq_len = min(current_seq_len * 2, original_seq_len)
             if rank == 0:
                 print(f"Epoch {global_epoch}: sequence length at {current_seq_len}")
         
-        dataset.seq_len = current_seq_len
+        # Update both datasets with current sequence length
+        train_dataset.seq_len = current_seq_len
+        if rank == 0:
+            val_dataset.seq_len = current_seq_len
         
+        # Create distributed sampler for training
         sampler = torch.utils.data.distributed.DistributedSampler(
-            dataset, num_replicas=world_size, rank=rank
-        ) if config["use_ddp"] else None
+            train_dataset, num_replicas=world_size, rank=rank
+        ) if config["use_ddp"] and world_size > 1 else None
         
-        dataloader = DataLoader(
-            dataset,
+        train_loader = DataLoader(
+            train_dataset,
             batch_size=config["batch_size"],
             sampler=sampler,
             shuffle=(sampler is None),
             num_workers=config["num_workers"],
             persistent_workers=True
         )
+        
         if sampler:
             sampler.set_epoch(global_epoch)
+        
         total_loss = 0
         accumulation_counter = 0
-        batch_bar = tqdm(enumerate(dataloader), total=len(dataloader),
+        batch_bar = tqdm(enumerate(train_loader), total=len(train_loader),
                         desc=f"Epoch {global_epoch+1}/{total_epochs}",
-                        position=1, leave=False
-                        )
+                        position=1, leave=False)
         
         optimizer.zero_grad()
         
@@ -264,33 +310,19 @@ def train_model(rank, tokenizer, world_size=0, forModel=config["forModel"], mode
             inputs = batch["input_ids"].to(device)
             targets = batch["labels"].to(device)
             
-            if scaler:
-                with torch.amp.autocast('cuda'):
-                    logits = model(inputs)
-                    loss = loss_fn(
-                        logits.view(-1, logits.size(-1)),
-                        targets.view(-1)
-                    ) / accumulation_steps
-            else:
+            with torch.amp.autocast(device_type=device.type, enabled=(device.type == 'cuda')):
                 logits = model(inputs)
                 loss = loss_fn(
-                    logits.view(-1, logits.size(-1)), 
+                    logits.view(-1, logits.size(-1)),
                     targets.view(-1)
                 ) / accumulation_steps
             
-            if scaler:
-                scaler.scale(loss).backward()
-            else:
-                loss.backward()
+            loss.backward()
             accumulation_counter += 1
             total_loss += loss.item() * accumulation_steps
             
             if accumulation_counter % accumulation_steps == 0:
-                if scaler:
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    optimizer.step()
+                optimizer.step()
                 optimizer.zero_grad()
             
             batch_bar.set_postfix(
@@ -298,49 +330,49 @@ def train_model(rank, tokenizer, world_size=0, forModel=config["forModel"], mode
                 avg_loss=total_loss/(batch_idx+1),
                 seq_len=current_seq_len
             )
+        
+        # Step scheduler after warmup
+        if global_epoch >= warmup_epochs:
+            scheduler.step()
+        
+        # Validation on rank 0
+        val_loss = float('inf')
+        if rank == 0:
+            val_loss = evaluate(model, val_loader, loss_fn, device, rank)
             
-        scheduler.step()
+            # Early stopping check
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                epochs_no_improve = 0
+                # Save best model
+                state_dict = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
+                torch.save(state_dict, save_path)
+                print(f"Saved best model (val_loss={val_loss:.4f})")
+            else:
+                epochs_no_improve += 1
+                print(f"No improvement {epochs_no_improve}/{patience} (val_loss={val_loss:.4f})")
+                
+                if epochs_no_improve >= patience:
+                    print(f"Early stopping at epoch {global_epoch}")
+                    break
         
-        # Calculate average epoch loss
-        epoch_avg_loss = total_loss / len(dataloader)
-        
-        # Check if we need to extend training
-        if global_epoch == original_epochs - 1 and epoch_avg_loss > 1.0:
-            # Loss still above 1.0 after initial epochs - add one more epoch
-            if rank == 0:
-                print(f"Loss {epoch_avg_loss:.4f} > 1.0 after {original_epochs} epochs - adding one more epoch")
-            total_epochs += 1
-            epoch_bar.total = total_epochs
-            epoch_bar.refresh()
-        
+        # Update epoch progress
         if rank == 0:
             epoch_bar.update(1)
             epoch_bar.set_postfix(
-                avg_loss=epoch_avg_loss,
+                train_loss=total_loss/len(train_loader),
+                val_loss=val_loss,
                 seq_len=current_seq_len,
-                lr= scheduler.get_last_lr()[0]
+                lr=optimizer.param_groups[0]['lr']
             )
-            print(f"Epoch {global_epoch+1} | Loss: {epoch_avg_loss:.4f} | Seq Len: {current_seq_len} | LR: {scheduler.get_last_lr()[0]:.7f}")
-        
-        global_epoch += 1
-        
-    if rank == 0:
-        save_path = os.path.join(config["forModel"], config["model_path"])
-        if config["use_ddp"] and world_size > 1:
-            # DDP wrapped model
-            state_dict = model.module.state_dict()
-        else:
-            # Regular model
-            state_dict = model.state_dict()
-        torch.save(state_dict, save_path)
-        print(f"Model saved to {save_path}")
+            print(f"Epoch {global_epoch+1} | Train Loss: {total_loss/len(train_loader):.4f} | Val Loss: {val_loss:.4f} | Seq Len: {current_seq_len} | LR: {optimizer.param_groups[0]['lr']:.7f}")
     
-    if config["use_ddp"] and world_size > 1:
+    if rank == 0 and config["use_ddp"] and world_size > 1:
         dist.destroy_process_group()
     return model
 
 # =====================
-# 5. GENERATION FUNCTION
+# 5. GENERATION FUNCTION (WITH PROMPT TRUNCATION)
 # =====================
 def top_k_top_p_filtering(logits, top_k=config["top_k"], top_p=config["top_p"]):
     if top_k > 0:
@@ -368,9 +400,16 @@ def top_k_top_p_filtering(logits, top_k=config["top_k"], top_p=config["top_p"]):
     return logits
 
 def generate_text(model, tokenizer, prompt, max_length=config["max_length"], temperature=config["temperature"]):
-    """Generate text with top-k and top-p sampling from prompt"""
+    """Generate text with prompt truncation and sampling"""
     model.eval()
     input_ids = tokenizer.encode(prompt).ids
+    
+    # Truncate prompt if longer than model can handle
+    max_ctx = config["seq_len"] - max_length - 1
+    if len(input_ids) > max_ctx:
+        input_ids = input_ids[-max_ctx:]
+        print(f"Truncated prompt to {len(input_ids)} tokens")
+    
     eos_id = tokenizer.token_to_id("<eos>")
 
     for _ in range(max_length):
@@ -380,11 +419,7 @@ def generate_text(model, tokenizer, prompt, max_length=config["max_length"], tem
             logits = model(inputs)[0, -1, :]
             
         # Apply sampling techniques
-        logits = top_k_top_p_filtering(
-            logits,
-            top_k=config["top_k"],
-            top_p=config["top_p"]
-        )
+        logits = top_k_top_p_filtering(logits)
         
         # Apply temperature
         logits = logits / temperature
@@ -397,7 +432,6 @@ def generate_text(model, tokenizer, prompt, max_length=config["max_length"], tem
         if next_id == eos_id:
             break
 
-    # Ensure proper spacing between tokens
     return tokenizer.decode(input_ids, skip_special_tokens=True)
 
 # =====================
@@ -412,9 +446,9 @@ def main():
     # Determine if we need to train
     if model_exists:
         retr = input("Model exists. Retrain? (y/n): ").lower().strip()
-        while retr not in ["y", "yes", "n", "no"]:
+        while retr not in ("y", "yes", "n", "no"):
             retr = input("Please use yes(y) or no(n): ")
-        retrain = (retr in ["y", "yes"])
+        retrain = retr.startswith('y')
     else:
         retrain = True
     
@@ -424,34 +458,32 @@ def main():
             world_size = torch.cuda.device_count()
             torch.multiprocessing.spawn(
                 train_model,
-                args=(tokenizer, world_size, config["forModel"]),
+                args=(tokenizer, world_size, config["forModel"], None),
                 nprocs=world_size,
                 join=True
             )
         else:
-            train_model(0, tokenizer, world_size=1)
+            train_model(0, tokenizer, world_size=1, model=None)
     
-    # Load model for generation
+    # Load best model for generation
     model = NanoGPT(vocab_size=tokenizer.get_vocab_size())
-    
-    if os.path.exists(model_path) and os.path.getsize(model_path) > 0:
-        model.load_state_dict(torch.load(model_path, map_location=config["device"]))
+    model.load_state_dict(torch.load(model_path, map_location=config["device"]))
     model.to(config["device"])
     
-    # Compile for faster inference
+    # Compile for faster inference (if available)
     if sys.platform != "win32":
         try:
             model = torch.compile(model)
         except Exception as e:
             print("Could not compile model. Using uncompiled version:", e)
     else:
-        print("Skipping torch.compile on Windows (no cl.exe).")
+        print("Skipping torch.compile on Windows")
     
     # Interactive generation
     print("\nGPT Ready! Type your prompt (or 'quit' to exit)")
     while True:
         prompt = input("\nPrompt: ")
-        if prompt.lower().strip() in ["", "quit", "exit"]:
+        if prompt.lower().strip() in ("", "quit", "exit"):
             break
         response = generate_text(model, tokenizer, prompt)
         print(f"Generated: {response}")

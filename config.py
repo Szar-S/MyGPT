@@ -7,20 +7,24 @@ config = {
     "bpe_tokenizer": "bpe_tokenizer.json",
     
     # Model Architecture 
-    "vocab_size": 10000,         # int
-    "embed_size": 256,           # int
-    "n_layers": 8,              # int
-    "n_heads": 8,                # int
+    "vocab_size": 20000,         # int
+    "embed_size": 128,           # int
+    "n_layers": 4,               # int
+    "n_heads": 4,                # int
+    "drapout_rate": 0.1,                
     
     # Training Parameters
     "seq_len": 256,              # int
     "start_seq_len": 32,
-    "batch_size": 8,             # int
-    "epochs": 5,                 # int
-    "seq_len_double_interval":5,
-    "learning_rate": 4e-4,       # float
-    "gradient_accumulation_steps": 4,
-    "learning_rate_decay": 0.95,
+    "batch_size": 16,             # int
+    "epochs": 10,                 # int
+    "seq_len_double_interval":4,
+    "learning_rate": 3e-4,       # float
+    "gradient_accumulation_steps": 2,
+    "learning_rate_decay": 0.9,
+    "weight_decay": 0.01,
+    "warmup_epochs":2,
+    "patience": 3,
     
     # Generation Settings
     "top_k": 40,                 # int

@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 from tokenizers import Tokenizer, decoders
 import glob
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader
 import torch.utils.data.distributed
 from config import config
 from refresh import extract_text_from_pdfs_and_txts, create_tokenizer, token_save
@@ -148,7 +148,7 @@ class NanoGPT(nn.Module):
         return self.lm_head(x)
 
 # =====================
-# 4. TRAINING FUNCTION
+# 4. TRAINING FUNCTION (WITH DYNAMIC EPOCH EXTENSION)
 # ====================
 def setup_ddp(rank, world_size):
     os.environ['MASTER_ADDR'] = 'localhost'
@@ -241,14 +241,16 @@ def train_model(rank, tokenizer, world_size=0, forModel=config["forModel"], mode
     seq_len_double_interval = config["seq_len_double_interval"]
     current_seq_len = start_seq_len
     original_seq_len = config["seq_len"]
-    total_epochs = config["epochs"]
     
     # Training state tracking
     global_epoch = 0
     best_val_loss = float('inf')
-    epochs_no_improve = 0
-    patience = config.get("patience", 3)  # Default 3 epochs patience
-    warmup_epochs = config.get("warmup_epochs", 2)  # Default 2 epoch warmup
+    warmup_epochs = config.get("warmup_epochs", 2)
+    
+    # NEW: Dynamic epoch extension setup
+    original_epochs = config["epochs"]
+    total_epochs = original_epochs
+    loss_below_one = False
     
     # Create validation dataloader (only needed for rank 0)
     val_loader = None
@@ -261,9 +263,9 @@ def train_model(rank, tokenizer, world_size=0, forModel=config["forModel"], mode
         )
     
     # Epoch progress bar
-    epoch_bar = tqdm(range(total_epochs), desc="Epochs", position=0)
+    epoch_bar = tqdm(total=total_epochs, desc="Epochs", position=0)
     
-    for global_epoch in range(total_epochs):
+    while global_epoch < total_epochs:
         # Learning rate warmup
         if global_epoch < warmup_epochs:
             warmup_factor = 0.1 + 0.9 * global_epoch / warmup_epochs
@@ -310,7 +312,7 @@ def train_model(rank, tokenizer, world_size=0, forModel=config["forModel"], mode
             inputs = batch["input_ids"].to(device)
             targets = batch["labels"].to(device)
             
-            with torch.amp.autocast(device_type=device.type, enabled=(device.type == 'cuda')):
+            with torch.cuda.amp.autocast(enabled=(device.type == 'cuda')):
                 logits = model(inputs)
                 loss = loss_fn(
                     logits.view(-1, logits.size(-1)),
@@ -335,44 +337,65 @@ def train_model(rank, tokenizer, world_size=0, forModel=config["forModel"], mode
         if global_epoch >= warmup_epochs:
             scheduler.step()
         
+        # Calculate average training loss
+        avg_train_loss = total_loss / len(train_loader)
+        
+        # NEW: Dynamic epoch extension logic
+        if not loss_below_one:
+            if avg_train_loss < 1.0:
+                loss_below_one = True
+                if rank == 0:
+                    print(f"Loss dropped below 1.0 at epoch {global_epoch+1}")
+            else:
+                total_epochs += 1
+                epoch_bar.total = total_epochs
+                epoch_bar.refresh()
+                if rank == 0:
+                    print(f"Adding extra epoch (total now: {total_epochs})")
+        
         # Validation on rank 0
         val_loss = float('inf')
         if rank == 0:
             val_loss = evaluate(model, val_loader, loss_fn, device, rank)
             
-            # Early stopping check
+            # Save best model based on validation loss
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                epochs_no_improve = 0
-                # Save best model
                 state_dict = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
                 torch.save(state_dict, save_path)
                 print(f"Saved best model (val_loss={val_loss:.4f})")
-            else:
-                epochs_no_improve += 1
-                print(f"No improvement {epochs_no_improve}/{patience} (val_loss={val_loss:.4f})")
-                
-                if epochs_no_improve >= patience:
-                    print(f"Early stopping at epoch {global_epoch}")
-                    break
         
         # Update epoch progress
         if rank == 0:
             epoch_bar.update(1)
             epoch_bar.set_postfix(
-                train_loss=total_loss/len(train_loader),
+                train_loss=avg_train_loss,
                 val_loss=val_loss,
                 seq_len=current_seq_len,
-                lr=optimizer.param_groups[0]['lr']
+                lr=optimizer.param_groups[0]['lr'],
+                extended_epochs=total_epochs - original_epochs
             )
-            print(f"Epoch {global_epoch+1} | Train Loss: {total_loss/len(train_loader):.4f} | Val Loss: {val_loss:.4f} | Seq Len: {current_seq_len} | LR: {optimizer.param_groups[0]['lr']:.7f}")
+            status = f"Epoch {global_epoch+1}/{total_epochs} | Train: {avg_train_loss:.4f} | Val: {val_loss:.4f}"
+            if loss_below_one:
+                status += " | loss < 1.0 achived"
+            else:
+                status += f" | loss > 1.0 Adding epochs"
+            print(status)
+        
+        global_epoch += 1
     
-    if rank == 0 and config["use_ddp"] and world_size > 1:
+    # Final model save
+    if rank == 0:
+        state_dict = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
+        torch.save(state_dict, save_path)
+        print(f"Training complete. Final model saved to {save_path}")
+    
+    if config["use_ddp"] and world_size > 1:
         dist.destroy_process_group()
     return model
 
 # =====================
-# 5. GENERATION FUNCTION (WITH PROMPT TRUNCATION)
+# 5. GENERATION FUNCTION
 # =====================
 def top_k_top_p_filtering(logits, top_k=config["top_k"], top_p=config["top_p"]):
     if top_k > 0:

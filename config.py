@@ -35,6 +35,8 @@ config = {
     "include_prompt": False,
     "repeat_generate": True,
     "repeat_int": 10,
+    "write_to_file": True,
+    
     # System
     "use_ddp": True,            # bool
     "num_workers": 4,            #int

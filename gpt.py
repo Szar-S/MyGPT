@@ -11,6 +11,7 @@ from tqdm import tqdm
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 import sys
+import textwrap
 
 # =====================
 # 1. TOKENIZER SETUP
@@ -111,13 +112,13 @@ class NanoGPT(nn.Module):
         self.token_embed = nn.Embedding(vocab_size, embed_size)
         self.pos_embed = nn.Embedding(config["seq_len"], embed_size)
         
-        # Add dropout to transformer layers
+        # Transformer layers with residual connections
         self.blocks = nn.ModuleList([
             nn.TransformerEncoderLayer(
                 d_model=embed_size,
                 nhead=n_heads,
                 dim_feedforward=4*embed_size,
-                dropout=dropout_rate,  # ADDED DROPOUT
+                dropout=dropout_rate,
                 batch_first=True
             ) for _ in range(n_layers)
         ])
@@ -148,7 +149,7 @@ class NanoGPT(nn.Module):
         return self.lm_head(x)
 
 # =====================
-# 4. TRAINING FUNCTION
+# 4. TRAINING FUNCTION WITH OPTIMIZED SETTINGS
 # ====================
 def setup_ddp(rank, world_size):
     os.environ['MASTER_ADDR'] = 'localhost'
@@ -218,18 +219,22 @@ def train_model(rank, tokenizer, world_size=0, forModel=config["forModel"], mode
     if config["use_ddp"] and world_size > 1:
         model = DDP(model, device_ids=[rank])
     
-    # Add weight decay (default 0.01 if not in config)
+    # Add weight decay
     weight_decay = config.get("weight_decay", 0.01)
     optimizer = torch.optim.AdamW(
         model.parameters(), 
         lr=config["learning_rate"],
-        weight_decay=weight_decay  # ADDED WEIGHT DECAY
+        weight_decay=weight_decay,
+        betas=(0.9, 0.98),
+        eps=1e-6
     )
     
     accumulation_steps = config["gradient_accumulation_steps"]
+    
+    # Simpler but effective learning rate scheduler
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
-        T_max=config["learning_rate_decay"],
+        T_max=config.get("lr_decay_steps", 1000),
         eta_min=config["learning_rate"] / 10
     )
     
@@ -245,14 +250,14 @@ def train_model(rank, tokenizer, world_size=0, forModel=config["forModel"], mode
     # Training state tracking
     global_epoch = 0
     best_val_loss = float('inf')
-    warmup_epochs = config.get("warmup_epochs", 2)
+    warmup_epochs = config.get("warmup_epochs", 3)
     
-    # NEW: Dynamic epoch extension setup
+    # Dynamic epoch extension setup
     original_epochs = config["epochs"]
     total_epochs = original_epochs
     loss_below_one = False
     
-    # Create validation dataloader (only needed for rank 0)
+    # Create validation dataloader
     val_loader = None
     if rank == 0:
         val_loader = DataLoader(
@@ -268,22 +273,22 @@ def train_model(rank, tokenizer, world_size=0, forModel=config["forModel"], mode
     while global_epoch < total_epochs:
         # Learning rate warmup
         if global_epoch < warmup_epochs:
-            warmup_factor = 0.1 + 0.9 * global_epoch / warmup_epochs
+            warmup_factor = min(1.0, (global_epoch + 1) / warmup_epochs)
             for pg in optimizer.param_groups:
                 pg['lr'] = config["learning_rate"] * warmup_factor
         
-        # Update sequence length for curriculum learning
+        # Update sequence length
         if global_epoch > 0 and global_epoch % seq_len_double_interval == 0:
             current_seq_len = min(current_seq_len * 2, original_seq_len)
             if rank == 0:
                 print(f"Epoch {global_epoch}: sequence length at {current_seq_len}")
         
-        # Update both datasets with current sequence length
+        # Update datasets with current sequence length
         train_dataset.seq_len = current_seq_len
         if rank == 0:
             val_dataset.seq_len = current_seq_len
         
-        # Create distributed sampler for training
+        # Create distributed sampler
         sampler = torch.utils.data.distributed.DistributedSampler(
             train_dataset, num_replicas=world_size, rank=rank
         ) if config["use_ddp"] and world_size > 1 else None
@@ -312,7 +317,7 @@ def train_model(rank, tokenizer, world_size=0, forModel=config["forModel"], mode
             inputs = batch["input_ids"].to(device)
             targets = batch["labels"].to(device)
             
-            with torch.amp.autocast(device_type=device.type,enabled=(device.type == 'cuda')):
+            with torch.amp.autocast('cuda', enabled=(device.type == 'cuda')):
                 logits = model(inputs)
                 loss = loss_fn(
                     logits.view(-1, logits.size(-1)),
@@ -323,9 +328,12 @@ def train_model(rank, tokenizer, world_size=0, forModel=config["forModel"], mode
             accumulation_counter += 1
             total_loss += loss.item() * accumulation_steps
             
+            # Gradient clipping to prevent explosions
             if accumulation_counter % accumulation_steps == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
                 optimizer.zero_grad()
+                scheduler.step()  # Step after each gradient update
             
             batch_bar.set_postfix(
                 loss=loss.item() * accumulation_steps, 
@@ -333,14 +341,10 @@ def train_model(rank, tokenizer, world_size=0, forModel=config["forModel"], mode
                 seq_len=current_seq_len
             )
         
-        # Step scheduler after warmup
-        if global_epoch >= warmup_epochs:
-            scheduler.step()
-        
         # Calculate average training loss
         avg_train_loss = total_loss / len(train_loader)
         
-        # NEW: Dynamic epoch extension logic
+        # Dynamic epoch extension logic
         if not loss_below_one:
             if avg_train_loss < 1.0:
                 loss_below_one = True
@@ -353,12 +357,12 @@ def train_model(rank, tokenizer, world_size=0, forModel=config["forModel"], mode
                 if rank == 0:
                     print(f"Adding extra epoch (total now: {total_epochs})")
         
-        # Validation on rank 0
+        # Validation
         val_loss = float('inf')
         if rank == 0:
             val_loss = evaluate(model, val_loader, loss_fn, device, rank)
             
-            # Save best model based on validation loss
+            # Save best model
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 state_dict = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
@@ -377,9 +381,9 @@ def train_model(rank, tokenizer, world_size=0, forModel=config["forModel"], mode
             )
             status = f"Epoch {global_epoch+1}/{total_epochs} | Train: {avg_train_loss:.4f} | Val: {val_loss:.4f}"
             if loss_below_one:
-                status += " | loss < 1.0 achived"
+                status += " | loss < 1.0 achieved"
             else:
-                status += f" | loss > 1.0 Adding epochs"
+                status += f" | loss > 1.0 - Adding epochs"
             print(status)
         
         global_epoch += 1
@@ -393,6 +397,7 @@ def train_model(rank, tokenizer, world_size=0, forModel=config["forModel"], mode
     if config["use_ddp"] and world_size > 1:
         dist.destroy_process_group()
     return model
+
 
 # =====================
 # 5. GENERATION FUNCTION
@@ -510,6 +515,26 @@ def main():
             break
         response = generate_text(model, tokenizer, prompt)
         print(f"Generated: {response}")
+       
+        os.makedirs("output", exist_ok=True)
+        txt_path = os.path.join("output", "*.txt")
+        txt_Files = glob.glob(txt_path)
+        savedResponse = '\n'.join(textwrap.wrap(response, 80))
+        if txt_Files:
+            tempFiles = [os.path.basename(s).replace(".txt", "") for s in txt_Files]
+            i = str(int(max(tempFiles)) + 1) + ".txt"
+            i_path = os.path.join("output", i)
+            os.makedirs(os.path.dirname(i_path), exist_ok=True)
+            
+            with open(i_path, "w", encoding="utf-8") as f:
+                f.write(savedResponse)
+        else:
+            i = "1.txt"
+            i_path = os.path.join("output", i)
+            os.makedirs(os.path.dirname(i_path), exist_ok=True)
+            
+            with open(i_path, "w", encoding="utf-8") as f:
+                f.write(savedResponse)
 
 if __name__ == "__main__":
     main()

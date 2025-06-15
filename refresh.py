@@ -56,7 +56,8 @@ def extract_text_from_pdfs_and_txts(folder=None, forModel=None):
                 print(f"Processed TXT file: {filename}")
         except Exception as e:
             print(f"Error processing {filename}: {str(e)}")
-    textAll = textAll.replace("�", "").replace("---", " ").replace("--","").replace("   ", " ").replace("  ", " ")
+    
+    textAll = textAll.replace("�", "").replace("---", " ").replace("--","").replace(" " * 3, " ").replace(" " * 2, " ")
     if textAll.strip():
         textAll = " ".join(textAll.split())
         

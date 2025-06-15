@@ -32,7 +32,9 @@ config = {
     "temperature": 0.7,           # float
     "min_data_size": 300,        # int
     "max_length": 250,            # int
-    
+    "include_prompt": False,
+    "repeat_generate": True,
+    "repeat_int": 10,
     # System
     "use_ddp": True,            # bool
     "num_workers": 4,            #int

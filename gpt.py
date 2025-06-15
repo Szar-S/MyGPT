@@ -460,7 +460,8 @@ def generate_text(model, tokenizer, prompt, max_length=config["max_length"], tem
         if next_id == eos_id:
             break
 
-    return tokenizer.decode(input_ids, skip_special_tokens=True)
+    return tokenizer.decode(input_ids, skip_special_tokens=True) if config.get("include_prompt", True) else tokenizer.decode(input_ids[len(tokenizer.encode(prompt).ids):], skip_special_tokens=True)
+    #return tokenizer.decode(input_ids, skip_special_tokens=True)
 
 # =====================
 # MAIN EXECUTION
@@ -513,28 +514,41 @@ def main():
         prompt = input("\nPrompt: ")
         if prompt.lower().strip() in ("", "quit", "exit"):
             break
-        response = generate_text(model, tokenizer, prompt)
-        print(f"Generated: {response}")
-       
-        os.makedirs("output", exist_ok=True)
-        txt_path = os.path.join("output", "*.txt")
-        txt_Files = glob.glob(txt_path)
-        savedResponse = '\n'.join(textwrap.wrap(response, 80))
-        if txt_Files:
-            tempFiles = [os.path.basename(s).replace(".txt", "") for s in txt_Files]
-            i = str(int(max(tempFiles)) + 1) + ".txt"
-            i_path = os.path.join("output", i)
-            os.makedirs(os.path.dirname(i_path), exist_ok=True)
+        
+        if config.get("repeat_generate"):
+            response = generate_text(model, tokenizer, prompt)
+            new_response = generate_text(model, tokenizer, response)
+            response += new_response
+            i = 0
+            while i < config.get("repeat_int"):
+                new_response = generate_text(model, tokenizer, new_response)
+                response += new_response
+                i +=1
+                print(i)
+        else:
+            response = generate_text(model, tokenizer, prompt)
             
+        print(f"Generated: {response}")
+        
+        if config.get("write_to_file"):
+            os.makedirs("output", exist_ok=True)
+            txt_path = os.path.join("output", "*.txt")
+            txt_Files = glob.glob(txt_path)
+            savedResponse = '\n'.join(textwrap.wrap(response, 80))
+            if txt_Files:
+                tempFiles = [os.path.basename(s).replace(".txt", "") for s in txt_Files]
+                i = str(int(max(tempFiles)) + 1) + ".txt"
+                i_path = os.path.join("output", i)
+                os.makedirs(os.path.dirname(i_path), exist_ok=True)
+            
+            else:
+                i = "1.txt"
+                i_path = os.path.join("output", i)
+                os.makedirs(os.path.dirname(i_path), exist_ok=True)
+                
             with open(i_path, "w", encoding="utf-8") as f:
                 f.write(savedResponse)
         else:
-            i = "1.txt"
-            i_path = os.path.join("output", i)
-            os.makedirs(os.path.dirname(i_path), exist_ok=True)
-            
-            with open(i_path, "w", encoding="utf-8") as f:
-                f.write(savedResponse)
-
+            pass
 if __name__ == "__main__":
     main()

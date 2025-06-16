@@ -432,19 +432,28 @@ def generate_text(model, tokenizer, prompt, max_length=config["max_length"], tem
     model.eval()
     input_ids = tokenizer.encode(prompt).ids
     
-    # Truncate prompt if longer than model can handle
-    max_ctx = config["seq_len"] - max_length - 1
-    if len(input_ids) > max_ctx:
+    # Handle empty prompt case
+    if len(input_ids) == 0:
+        input_ids = [tokenizer.token_to_id("<bos>")]
+    
+    # Calculate maximum context length safely
+    max_ctx = max(1, config["seq_len"] - max_length - 1)  # Ensure at least 1 token
+    original_length = len(input_ids)
+    
+    # Truncate prompt if needed (keep at least 1 token)
+    if original_length > max_ctx:
         input_ids = input_ids[-max_ctx:]
         print(f"Truncated prompt to {len(input_ids)} tokens")
     
     eos_id = tokenizer.token_to_id("<eos>")
+    device = next(model.parameters()).device
+    initial_length = len(input_ids)  # Store initial length for generated-only output
 
     for _ in range(max_length):
-        inputs = torch.tensor([input_ids], dtype=torch.long).to(next(model.parameters()).device)
+        inputs = torch.tensor([input_ids], dtype=torch.long).to(device)
         
         with torch.no_grad():
-            logits = model(inputs)[0, -1, :]
+            logits = model(inputs)[0, -1, :]  # Get last token logits
             
         # Apply sampling techniques
         logits = top_k_top_p_filtering(logits)
@@ -460,8 +469,12 @@ def generate_text(model, tokenizer, prompt, max_length=config["max_length"], tem
         if next_id == eos_id:
             break
 
-    return tokenizer.decode(input_ids, skip_special_tokens=True) if config.get("include_prompt", True) else tokenizer.decode(input_ids[len(tokenizer.encode(prompt).ids):], skip_special_tokens=True)
-    #return tokenizer.decode(input_ids, skip_special_tokens=True)
+    # Handle include_prompt option safely
+    if config.get("include_prompt", True):
+        return tokenizer.decode(input_ids, skip_special_tokens=True)
+    else:
+        # Return only generated portion
+        return tokenizer.decode(input_ids[initial_length:], skip_special_tokens=True)
 
 # =====================
 # MAIN EXECUTION
@@ -510,33 +523,45 @@ def main():
     
     # Interactive generation
     print("\nGPT Ready! Type your prompt (or 'quit' to exit)")
+    
     while True:
         prompt = input("\nPrompt: ")
         if prompt.lower().strip() in ("", "quit", "exit"):
             break
         
-        if config.get("repeat_generate"):
-            response = generate_text(model, tokenizer, prompt)
-            new_response = generate_text(model, tokenizer, response)
-            response += new_response
+        response = generate_text(model, tokenizer, prompt)
+        
+        if config.get("repeat_generate") == True and config.get("include_prompt") == True:
             i = 0
-            while i < config.get("repeat_int"):
-                new_response = generate_text(model, tokenizer, new_response)
-                response += new_response
+            print(f"{i}. prompting")
+            while i-1 < config.get("repeat_int"):
+                response = generate_text(model, tokenizer, response)
                 i +=1
-                print(i)
+                print(f"{i}. prompting")    
+        elif config.get("repeat_generate") == True and config.get("include_prompt") == False:
+            i = 0
+            print(f"{i}. prompting")
+            while i < config.get("repeat_int"):
+                response += generate_text(model, tokenizer, response)
+                i +=1
+                print(f"{i}. prompting")
         else:
-            response = generate_text(model, tokenizer, prompt)
+            pass
             
         print(f"Generated: {response}")
         
         if config.get("write_to_file"):
+            
             os.makedirs("output", exist_ok=True)
             txt_path = os.path.join("output", "*.txt")
             txt_Files = glob.glob(txt_path)
+            
             savedResponse = '\n'.join(textwrap.wrap(response, 80))
             if txt_Files:
                 tempFiles = [os.path.basename(s).replace(".txt", "") for s in txt_Files]
+                while not str(max(tempFiles)).isnumeric():
+                    tempFiles.pop(max(tempFiles))
+                
                 i = str(int(max(tempFiles)) + 1) + ".txt"
                 i_path = os.path.join("output", i)
                 os.makedirs(os.path.dirname(i_path), exist_ok=True)

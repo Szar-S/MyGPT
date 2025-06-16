@@ -8,18 +8,18 @@ config = {
     
     # Model Architecture 
     "vocab_size": 10000,         # int
-    "embed_size": 192,           # int
-    "n_layers": 6,               # int
+    "embed_size": 132,           # int
+    "n_layers": 3,               # int
     "n_heads": 6,                # int
-    "drapout_rate": 0.1,                
+    "drapout_rate": 0.4,                
     
     # Training Parameters
-    "seq_len": 256,              # int
+    "seq_len": 128,              # int
     "start_seq_len": 32,
-    "batch_size": 8,             # int
-    "epochs": 3,                 # int
-    "seq_len_double_interval":6,
-    "learning_rate": 1e-4,       # float
+    "batch_size": 3,             # int
+    "epochs":8,                 # int
+    "seq_len_double_interval":2,
+    "learning_rate": 5e-4,       # float
     "gradient_accumulation_steps": 4,
     "lr_decay_steps": 500,
     "learning_rate_decay": 0.9,
@@ -27,11 +27,11 @@ config = {
     "warmup_epochs":4,
     
     # Generation Settings
-    "top_k": 40,                 # int
-    "top_p": 0.85,                # float
+    "top_k": 50,                 # int
+    "top_p": 0.92,                # float
     "temperature": 0.7,           # float
     "min_data_size": 300,        # int
-    "max_length": 250,            # int
+    "max_length": 150,            # int
     "include_prompt": False,
     "repeat_generate": True,
     "repeat_int": 10,

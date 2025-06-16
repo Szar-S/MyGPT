@@ -73,24 +73,36 @@ def extract_text_from_pdfs_and_txts(folder=None, forModel=None):
         return ""
     
 def create_tokenizer(text, forModel=None):
-    
     if forModel is None:
         forModel = config["forModel"]
     os.makedirs(forModel, exist_ok=True)
         
     tokenizer_path = os.path.join(forModel, config["bpe_tokenizer"])
-    tokenizer = Tokenizer(models.BPE())
+    
+    # Ensure special tokens are included
+    special_tokens = ["<unk>", "<pad>", "<bos>", "<eos>"]
+    tokenizer = Tokenizer(models.BPE(unk_token="<unk>"))
     tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel()
-    if os.path.exists(tokenizer_path):
-        tokenizer.from_file(tokenizer_path)
     
     trainer = trainers.BpeTrainer(
         vocab_size=config["vocab_size"],
         show_progress=True,
-        special_tokens=["<unk>", "<pad>", "<bos>", "<eos>"]
+        special_tokens=special_tokens
     )
-    tokenizer.train_from_iterator([text], trainer)
+    
+    # Train only if needed
+    if not os.path.exists(tokenizer_path) or os.path.getsize(tokenizer_path) == 0:
+        tokenizer.train_from_iterator([text], trainer)
+        tokenizer.save(tokenizer_path)
+    else:
+        tokenizer = Tokenizer.from_file(tokenizer_path)
+    
+    # Add decoder and ensure special tokens
     tokenizer.decoder = decoders.ByteLevel()
+    for token in special_tokens:
+        if tokenizer.token_to_id(token) is None:
+            tokenizer.add_special_tokens([token])
+    
     tokenizer.save(tokenizer_path)
     return tokenizer
 

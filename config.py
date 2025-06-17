@@ -28,7 +28,7 @@ config = {
     # Generation Settings
     "top_k": 30,
     "top_p": 0.85,
-    "temperature": 0.8,
+    "temperature": 0.9,
     "min_data_size": 100,
     "max_length": 200,
     "include_prompt": False,
@@ -40,7 +40,7 @@ config = {
     "use_ddp": False,
     "use_amp": True,
     "num_workers": 2,
-    "repetition_penalty": 1.25,
+    "repetition_penalty": 1.5,
     "checkpoint_every": 500,
     "device": "cuda" if torch.cuda.is_available() else "cpu"
 }

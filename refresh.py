@@ -132,6 +132,9 @@ def extract_text_from_pdfs_and_txts(folder=None, forModel=None):
         text = re.sub(r'\s*[\u2022\u25E6]\s*', '\n• ', text)
         text = re.sub(r'\s*\d+\.\s+', '\n1. ', text)
         
+        text = re.sub(r'(?<!\w)\.(?!\w)', ' ', text)
+        text = re.sub(r'\s([.,!?;:](?:\s|$))', r'\1', text)
+        
         # Final cleanup
         text = text.strip()
         return text

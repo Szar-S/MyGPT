@@ -86,21 +86,25 @@ class TextDataset(Dataset):
         return max(1, (self.num_tokens - 1) // self.seq_len)
 
     def __getitem__(self, idx):
-        start = idx * self.seq_len
-        end = start + self.seq_len + 1
+        start_pos = idx * self.seq_len
+        end_pos = start_pos + self.seq_len + 1
         
-        # Handle sequence truncation and padding
-        if end > self.num_tokens:
-            tokens = np.zeros(self.seq_len + 1, dtype=np.int32) + self.special_ids["pad"]
-            valid_len = min(self.seq_len + 1, self.num_tokens - start)
-            tokens[:valid_len] = self.tokens[start:start+valid_len]
-            tokens[valid_len-1] = self.special_ids["eos"]  # Mark end of sequence
+        if end_pos > self.num_tokens:
+            # Calculate actual available tokens
+            available = self.num_tokens - start_pos
+            # Get available tokens
+            chunk = list(self.tokens[start_pos:start_pos + available])
+            # Pad to full length +1 (for labels)
+            pad_len = (self.seq_len + 1) - available
+            chunk += [self.pad_id] * pad_len
+            # Set last real token to <eos>
+            if available > 0:
+                chunk[available - 1] = self.eos_id
         else:
-            tokens = np.array(self.tokens[start:end], dtype=np.int32)
-        
+            chunk = list(self.tokens[start_pos:end_pos])
         return {
-            "input_ids": torch.tensor(tokens[:-1], dtype=torch.long),
-            "labels": torch.tensor(tokens[1:], dtype=torch.long)
+            "input_ids": torch.tensor(chunk[:self.seq_len], dtype=torch.long),
+            "labels": torch.tensor(chunk[1:self.seq_len+1], dtype=torch.long)
         }
 
 # =====================
@@ -196,9 +200,16 @@ def evaluate(model, val_loader, loss_fn, device, rank):
             total_tokens += targets.numel()
     
     # Gather metrics across devices if DDP
-    if config["use_ddp"]:
-        dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_tokens, op=dist.ReduceOp.SUM)
+    if dist.is_initialized():  # Check if DDP is active
+        # Convert to tensors for proper reduction
+        total_loss_tensor = torch.tensor(total_loss).to(device)
+        total_tokens_tensor = torch.tensor(total_tokens).to(device)
+        
+        dist.all_reduce(total_loss_tensor, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_tokens_tensor, op=dist.ReduceOp.SUM)
+        
+        total_loss = total_loss_tensor.item()
+        total_tokens = total_tokens_tensor.item()
     
     avg_loss = total_loss / total_tokens
     perplexity = torch.exp(torch.tensor(avg_loss)).item()
@@ -228,7 +239,12 @@ def train_model(rank, tokenizer, world_size=0, forModel=config["forModel"], mode
     
     train_dataset = TextDataset(corpus_path, tokenizer, config["seq_len"], split='train')
     val_dataset = TextDataset(corpus_path, tokenizer, config["seq_len"], split='val')
-    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config["batch_size"],
+        shuffle=False,
+        num_workers=config["num_workers"]
+    )
     # Model initialization
     vocab_size = tokenizer.get_vocab_size()
     if model is None:
@@ -267,7 +283,7 @@ def train_model(rank, tokenizer, world_size=0, forModel=config["forModel"], mode
     
     # Loss function
     loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer.token_to_id("<pad>"))
-    scaler = torch.cuda.amp.GradScaler(enabled=config["use_amp"])
+    scaler = torch.amp.GradScaler('cuda', enabled=config["use_amp"])
     
     # Training loop
     best_val_loss = float('inf')
@@ -318,7 +334,7 @@ def train_model(rank, tokenizer, world_size=0, forModel=config["forModel"], mode
             progress.set_postfix(loss=loss.item())
         
         # Validation
-        val_loss, val_ppl = evaluate(model, val_dataset, loss_fn, device, rank)
+        val_loss, val_ppl = evaluate(model, val_loader, loss_fn, device, rank)
         
         # Save best model
         if rank == 0 and val_loss < best_val_loss:
@@ -366,11 +382,20 @@ def top_k_top_p_filtering(logits, top_k=0, top_p=0.0, filter_value=-float('Inf')
     
     return logits
 
-def apply_repetition_penalty(logits, input_ids, penalty=1.2):
-    unique_ids = torch.unique(input_ids[-10:])  # Consider last 10 tokens
+def apply_repetition_penalty(logits, input_ids, penalty=1.5, depth=20):  # Increased penalty and depth
+    if len(input_ids) == 0:
+        return logits
+        
+    # Consider last N tokens
+    recent_ids = input_ids[-depth:] if len(input_ids) > depth else input_ids
+    unique_ids = torch.unique(recent_ids)
+    
     for uid in unique_ids:
         if logits[uid] > 0:
-            logits[uid] /= penalty
+            # Apply penalty based on frequency
+            count = (recent_ids == uid).sum().item()
+            logits[uid] /= penalty * (1 + count * 0.2)
+            
     return logits
 
 def generate_text(model, tokenizer, prompt, max_length=150, temperature=0.7):
@@ -398,11 +423,15 @@ def generate_text(model, tokenizer, prompt, max_length=150, temperature=0.7):
             # Apply penalties and sampling
             logits = apply_repetition_penalty(logits, inputs[0])
             logits = top_k_top_p_filtering(logits, config["top_k"], config["top_p"])
-            logits = logits / temperature
+            logits = logits / max(temperature, 0.1)
             
             # Sample next token
             probs = torch.softmax(logits, dim=-1)
             next_id = torch.multinomial(probs, num_samples=1).item()
+            
+            if input_ids and next_id == input_ids[-1]:
+                probs[next_id] = 0
+                next_id = torch.multinomial(probs, num_samples=1).item()
             
             input_ids.append(next_id)
             if next_id == eos_id:
@@ -452,7 +481,7 @@ def main():
     while True:
         try:
             prompt = input("\nPrompt: ")
-            if prompt.lower() in ('exit', 'quit'):
+            if prompt.lower().strip() in ('exit', 'quit', ""):
                 break
             
             response = generate_text(model, tokenizer, prompt)

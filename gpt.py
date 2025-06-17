@@ -1,20 +1,21 @@
 import os
 import torch
 import torch.nn as nn
-from tokenizers import Tokenizer, decoders
-import glob
-from torch.utils.data import Dataset, DataLoader
-import torch.utils.data.distributed
-from config import config
-from refresh import extract_text_from_pdfs_and_txts, create_tokenizer, token_save
-from tqdm import tqdm 
 import torch.distributed as dist
+from tokenizers import Tokenizer
+from torch.utils.data import Dataset, DataLoader
 from torch.nn.parallel import DistributedDataParallel as DDP
+from tqdm import tqdm
+import numpy as np
 import sys
 import textwrap
+import glob
+import re
+from config import config
+from refresh import extract_text_from_pdfs_and_txts, create_tokenizer, token_save
 
 # =====================
-# 1. TOKENIZER SETUP
+# 1. TOKENIZER SETUP (Improved)
 # =====================
 def initialize_tokenizer(forModel=None):
     if forModel is None:
@@ -24,7 +25,8 @@ def initialize_tokenizer(forModel=None):
     os.makedirs(forModel, exist_ok=True)
     data_path = os.path.join(forModel, config["data_corpus"])
     
-    if not glob.glob(tokenizer_path) or os.path.getsize(tokenizer_path) == 0:
+    # Create tokenizer if missing or invalid
+    if not os.path.exists(tokenizer_path) or os.path.getsize(tokenizer_path) == 0:
         if not os.path.exists(data_path) or os.path.getsize(data_path) == 0:    
             text = extract_text_from_pdfs_and_txts()
         else:
@@ -34,9 +36,11 @@ def initialize_tokenizer(forModel=None):
     else:
         try:
             tokenizer = Tokenizer.from_file(tokenizer_path)
+            # Validate tokenizer
+            if tokenizer.get_vocab_size() < 100:
+                raise ValueError("Invalid vocabulary size")
         except Exception as e:
-            print(f"Error loading tokenizer: {e}")
-            input("Hit enter to create a new one.")
+            print(f"Tokenizer error: {e}. Rebuilding...")
             if not os.path.exists(data_path) or os.path.getsize(data_path) == 0:    
                 text = extract_text_from_pdfs_and_txts()
             else:
@@ -44,12 +48,16 @@ def initialize_tokenizer(forModel=None):
                     text = f.read()
             tokenizer = create_tokenizer(text)
     
-    tokenizer = Tokenizer.from_file(tokenizer_path)
-    tokenizer.decoder = decoders.ByteLevel()
+    # Add special tokens if missing
+    special_tokens = ["<unk>", "<pad>", "<bos>", "<eos>"]
+    for token in special_tokens:
+        if tokenizer.token_to_id(token) is None:
+            tokenizer.add_special_tokens([token])
+    
     return tokenizer
 
 # =====================
-# 2. DATASET HANDLING
+# 2. DATASET HANDLING (Optimized)
 # =====================
 class TextDataset(Dataset):
     def __init__(self, corpus_path, tokenizer, seq_len=None, split='train'):
@@ -60,7 +68,7 @@ class TextDataset(Dataset):
         self.tokens = token_save(tokenizer, corpus_path)
         self.num_tokens = len(self.tokens)
         
-        # Split dataset (90% train, 10% validation)
+        # Split dataset
         split_idx = int(0.9 * self.num_tokens)
         if split == 'train':
             self.tokens = self.tokens[:split_idx]
@@ -68,123 +76,151 @@ class TextDataset(Dataset):
             self.tokens = self.tokens[split_idx:]
         self.num_tokens = len(self.tokens)
         
-        self.bos_id = tokenizer.token_to_id("<bos>")
-        self.eos_id = tokenizer.token_to_id("<eos>")
-        self.pad_id = tokenizer.token_to_id("<pad>")
+        self.special_ids = {
+            "bos": tokenizer.token_to_id("<bos>"),
+            "eos": tokenizer.token_to_id("<eos>"),
+            "pad": tokenizer.token_to_id("<pad>")
+        }
 
     def __len__(self):
-        return max(1, self.num_tokens // self.seq_len)
+        return max(1, (self.num_tokens - 1) // self.seq_len)
 
     def __getitem__(self, idx):
-        start_pos = idx * self.seq_len
-        end_pos = start_pos + self.seq_len + 1
-
-        if end_pos > self.num_tokens:
-            pad_len = end_pos - self.num_tokens
-            chunk = list(self.tokens[start_pos:]) + [self.pad_id] * pad_len
-            # Set the last real token to <eos> if possible
-            eos_pos = self.num_tokens - start_pos - 1
-            if eos_pos >= 0 and eos_pos < len(chunk):
-                chunk[eos_pos] = self.eos_id
+        start = idx * self.seq_len
+        end = start + self.seq_len + 1
+        
+        # Handle sequence truncation and padding
+        if end > self.num_tokens:
+            tokens = np.zeros(self.seq_len + 1, dtype=np.int32) + self.special_ids["pad"]
+            valid_len = min(self.seq_len + 1, self.num_tokens - start)
+            tokens[:valid_len] = self.tokens[start:start+valid_len]
+            tokens[valid_len-1] = self.special_ids["eos"]  # Mark end of sequence
         else:
-            chunk = list(self.tokens[start_pos:end_pos])
+            tokens = np.array(self.tokens[start:end], dtype=np.int32)
+        
         return {
-            "input_ids": torch.tensor(chunk[:self.seq_len], dtype=torch.long),
-            "labels": torch.tensor(chunk[1:self.seq_len+1], dtype=torch.long)
+            "input_ids": torch.tensor(tokens[:-1], dtype=torch.long),
+            "labels": torch.tensor(tokens[1:], dtype=torch.long)
         }
 
 # =====================
-# 3. MODEL DEFINITION
+# 3. MODEL DEFINITION (Enhanced)
 # =====================
 class NanoGPT(nn.Module):
     def __init__(self, vocab_size, embed_size=None, n_layers=None, n_heads=None):
         super().__init__()
-        if embed_size is None:
-            embed_size = config["embed_size"]
-        if n_layers is None:
-            n_layers = config["n_layers"]
-        if n_heads is None:
-            n_heads = config["n_heads"]
+        # Configurable parameters with defaults
+        embed_size = embed_size or config["embed_size"]
+        n_layers = n_layers or config["n_layers"]
+        n_heads = n_heads or config["n_heads"]
+        dropout_rate = config.get("dropout_rate", 0.1)
         
-        # Use dropout from config with default 0.0 for backward compatibility
-        dropout_rate = config.get("dropout_rate", 0.0)
-        
+        # Embedding layers
         self.token_embed = nn.Embedding(vocab_size, embed_size)
-        self.max_positions = 1024
         self.pos_embed = nn.Embedding(config["seq_len"], embed_size)
+        self.embed_norm = nn.LayerNorm(embed_size)  # Pre-normalization
         
-        # Transformer layers with residual connections
+        # Transformer blocks
         self.blocks = nn.ModuleList([
             nn.TransformerEncoderLayer(
                 d_model=embed_size,
                 nhead=n_heads,
                 dim_feedforward=4*embed_size,
                 dropout=dropout_rate,
-                batch_first=True
+                activation='gelu',  # Better activation
+                batch_first=True,
+                norm_first=True  # Pre-LayerNorm architecture
             ) for _ in range(n_layers)
         ])
         
+        # Output layers
         self.ln_final = nn.LayerNorm(embed_size)
         self.lm_head = nn.Linear(embed_size, vocab_size)
+        
+        # Initialize weights
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
     def forward(self, input_ids):
         device = input_ids.device
-        _, seq_len = input_ids.shape
+        batch_size, seq_len = input_ids.shape
         
-        # Create position IDs
+        # Position embeddings
         pos_ids = torch.arange(0, seq_len, device=device).unsqueeze(0)
         
-        if seq_len > self.max_positions:
-            raise ValueError(f"Sequence length {seq_len} exceeds maximum position {self.max_positions}")
-        
-        # Embed tokens and positions
+        # Embedding combination
         token_embeds = self.token_embed(input_ids)
         pos_embeds = self.pos_embed(pos_ids)
         x = token_embeds + pos_embeds
+        x = self.embed_norm(x)
         
-        # Apply causal mask for autoregressive behavior
-        mask = nn.Transformer.generate_square_subsequent_mask(seq_len).to(device=device)
+        # Causal mask
+        mask = nn.Transformer.generate_square_subsequent_mask(seq_len).to(device)
         
-        # Process through transformer blocks
+        # Transformer processing
         for block in self.blocks:
-            x = block(x, src_key_padding_mask=None, src_mask=mask)
+            x = block(x, src_mask=mask)
         
+        # Final output
         x = self.ln_final(x)
         return self.lm_head(x)
 
 # =====================
-# 4. TRAINING FUNCTION WITH OPTIMIZED SETTINGS
-# ====================
+# 4. TRAINING FUNCTION (Optimized)
+# =====================
 def setup_ddp(rank, world_size):
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
 
 def evaluate(model, val_loader, loss_fn, device, rank):
-    """Run validation on the model"""
     model.eval()
-    total_val_loss = 0.0
+    total_loss, total_tokens = 0.0, 0
     with torch.no_grad():
         for batch in val_loader:
             inputs = batch["input_ids"].to(device)
             targets = batch["labels"].to(device)
-            logits = model(inputs)
-            loss = loss_fn(logits.view(-1, logits.size(-1)), targets.view(-1))
-            total_val_loss += loss.item()
-    avg_val_loss = total_val_loss / len(val_loader)
-    model.train()
-    return avg_val_loss
+            
+            with torch.amp.autocast('cuda', enabled=config["use_amp"]):
+                logits = model(inputs)
+                loss = loss_fn(logits.view(-1, logits.size(-1)), targets.view(-1))
+            
+            total_loss += loss.item() * targets.numel()
+            total_tokens += targets.numel()
+    
+    # Gather metrics across devices if DDP
+    if config["use_ddp"]:
+        dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_tokens, op=dist.ReduceOp.SUM)
+    
+    avg_loss = total_loss / total_tokens
+    perplexity = torch.exp(torch.tensor(avg_loss)).item()
+    
+    if rank == 0:
+        print(f"Validation Loss: {avg_loss:.4f} | Perplexity: {perplexity:.2f}")
+    return avg_loss, perplexity
 
 def train_model(rank, tokenizer, world_size=0, forModel=config["forModel"], model=None):
-    if config["use_ddp"] and world_size > 1:
+    # DDP setup
+    use_ddp = config["use_ddp"] and world_size > 1
+    if use_ddp:
         setup_ddp(rank, world_size)
         device = rank
         torch.cuda.set_device(device)
     else:
         device = torch.device(config["device"])
     
+    # Path setup
     corpus_path = os.path.join(forModel, config["data_corpus"])
     save_path = os.path.join(forModel, config["model_path"])
+    checkpoint_path = os.path.join(forModel, "checkpoint.pth")
     
     # Initialize datasets
     if not os.path.exists(corpus_path) or os.path.getsize(corpus_path) == 0:
@@ -193,109 +229,53 @@ def train_model(rank, tokenizer, world_size=0, forModel=config["forModel"], mode
     train_dataset = TextDataset(corpus_path, tokenizer, config["seq_len"], split='train')
     val_dataset = TextDataset(corpus_path, tokenizer, config["seq_len"], split='val')
     
-    if len(train_dataset) <= 300:
-        print("ERROR: Not enough data to create training samples.")
-        input("Press Enter to exit...")
-        return None
-
-    # Initialize model
+    # Model initialization
+    vocab_size = tokenizer.get_vocab_size()
     if model is None:
-        model = NanoGPT(
-            vocab_size=tokenizer.get_vocab_size(),
-            embed_size=config["embed_size"],
-            n_layers=config["n_layers"],
-            n_heads=config["n_heads"]
-        )
+        model = NanoGPT(vocab_size=vocab_size)
     
-    # Load existing weights if available
-    if os.path.exists(save_path) and os.path.getsize(save_path) > 0:
-        try:
-            state_dict = torch.load(save_path, map_location=device)
-            if rank == 0:
-                print("Resuming training from existing model weights")
-            model.load_state_dict(state_dict)
-        except:
-            if rank == 0:
-                print("Couldn't load existing weights. Training from scratch")
-            
+    # Load checkpoint if available
+    start_epoch = 0
+    if os.path.exists(checkpoint_path) and os.path.getsize(checkpoint_path) > 0:
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state'])
+        if rank == 0:
+            print(f"Resuming from epoch {checkpoint['epoch']}")
+        start_epoch = checkpoint['epoch'] + 1
+    
     model = model.to(device)
-    
-    if config["use_ddp"] and world_size > 1:
+    if use_ddp:
         model = DDP(model, device_ids=[rank])
     
-    # Add weight decay
-    weight_decay = config.get("weight_decay", 0.01)
+    # Optimizer setup
     optimizer = torch.optim.AdamW(
         model.parameters(), 
         lr=config["learning_rate"],
-        weight_decay=weight_decay,
+        weight_decay=config["weight_decay"],
         betas=(0.9, 0.98),
         eps=1e-6
     )
     
-    accumulation_steps = config["gradient_accumulation_steps"]
-    
-    # Simpler but effective learning rate scheduler
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    # Scheduler
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
-        T_max=config.get("lr_decay_steps", 1000),
-        eta_min=config["learning_rate"] / 10
+        max_lr=config["learning_rate"],
+        total_steps=len(train_dataset) // config["batch_size"] * config["epochs"],
+        pct_start=0.1,
+        anneal_strategy='cos'
     )
     
+    # Loss function
     loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer.token_to_id("<pad>"))
-    model.train()
+    scaler = torch.cuda.amp.GradScaler(enabled=config["use_amp"])
     
-    # Curriculum learning setup
-    start_seq_len = config["start_seq_len"]
-    seq_len_double_interval = config["seq_len_double_interval"]
-    current_seq_len = start_seq_len
-    original_seq_len = config["seq_len"]
-    
-    # Training state tracking
-    global_epoch = 0
+    # Training loop
     best_val_loss = float('inf')
-    warmup_epochs = config.get("warmup_epochs", 3)
-    
-    # Dynamic epoch extension setup
-    original_epochs = config["epochs"]
-    total_epochs = original_epochs
-    loss_below_one = False
-    
-    # Create validation dataloader
-    val_loader = None
-    if rank == 0:
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=config["batch_size"],
-            shuffle=False,
-            num_workers=config["num_workers"]
-        )
-    
-    # Epoch progress bar
-    epoch_bar = tqdm(total=total_epochs, desc="Epochs", position=0)
-    
-    while global_epoch < total_epochs:
-        # Learning rate warmup
-        if global_epoch < warmup_epochs:
-            warmup_factor = min(1.0, (global_epoch + 1) / warmup_epochs)
-            for pg in optimizer.param_groups:
-                pg['lr'] = config["learning_rate"] * warmup_factor
-        
-        # Update sequence length
-        if global_epoch > 0 and global_epoch % seq_len_double_interval == 0:
-            current_seq_len = min(current_seq_len * 2, original_seq_len)
-            if rank == 0:
-                print(f"Epoch {global_epoch}: sequence length at {current_seq_len}")
-        
-        # Update datasets with current sequence length
-        train_dataset.seq_len = current_seq_len
-        if rank == 0:
-            val_dataset.seq_len = current_seq_len
-        
-        # Create distributed sampler
+    for epoch in range(start_epoch, config["epochs"]):
+        # Create data loader
         sampler = torch.utils.data.distributed.DistributedSampler(
             train_dataset, num_replicas=world_size, rank=rank
-        ) if config["use_ddp"] and world_size > 1 else None
+        ) if use_ddp else None
         
         train_loader = DataLoader(
             train_dataset,
@@ -307,183 +287,128 @@ def train_model(rank, tokenizer, world_size=0, forModel=config["forModel"], mode
         )
         
         if sampler:
-            sampler.set_epoch(global_epoch)
+            sampler.set_epoch(epoch)
         
+        # Training
+        model.train()
         total_loss = 0
-        accumulation_counter = 0
-        batch_bar = tqdm(enumerate(train_loader), total=len(train_loader),
-                        desc=f"Epoch {global_epoch+1}/{total_epochs}",
-                        position=1, leave=False)
+        progress = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config['epochs']}", disable=(rank != 0))
         
-        optimizer.zero_grad()
-        
-        for batch_idx, batch in batch_bar:
+        for batch in progress:
             inputs = batch["input_ids"].to(device)
             targets = batch["labels"].to(device)
             
-            with torch.amp.autocast('cuda', enabled=(device.type == 'cuda')):
+            with torch.amp.autocast('cuda', enabled=config["use_amp"]):
                 logits = model(inputs)
-                loss = loss_fn(
-                    logits.view(-1, logits.size(-1)),
-                    targets.view(-1)
-                ) / accumulation_steps
+                loss = loss_fn(logits.view(-1, logits.size(-1)), targets.view(-1))
+                loss = loss / config["gradient_accumulation_steps"]
             
-            loss.backward()
-            accumulation_counter += 1
-            total_loss += loss.item() * accumulation_steps
+            scaler.scale(loss).backward()
+            total_loss += loss.item() * config["gradient_accumulation_steps"]
             
-            # Gradient clipping to prevent explosions
-            if accumulation_counter % accumulation_steps == 0:
+            # Gradient accumulation
+            if (progress.n + 1) % config["gradient_accumulation_steps"] == 0:
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
-                optimizer.zero_grad()
-                scheduler.step()  # Step after each gradient update
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                scheduler.step()
             
-            batch_bar.set_postfix(
-                loss=loss.item() * accumulation_steps, 
-                avg_loss=total_loss/(batch_idx+1),
-                seq_len=current_seq_len
-            )
-        
-        # Calculate average training loss
-        avg_train_loss = total_loss / len(train_loader)
-        
-        # Dynamic epoch extension logic
-        if not loss_below_one:
-            if avg_train_loss < 1.0:
-                loss_below_one = True
-                if rank == 0:
-                    print(f"Loss dropped below 1.0 at epoch {global_epoch+1}")
-            else:
-                total_epochs += 1
-                epoch_bar.total = total_epochs
-                epoch_bar.refresh()
-                if rank == 0:
-                    print(f"Adding extra epoch (total now: {total_epochs})")
+            progress.set_postfix(loss=loss.item())
         
         # Validation
-        val_loss = float('inf')
-        if rank == 0:
-            val_loss = evaluate(model, val_loader, loss_fn, device, rank)
-            
-            # Save best model
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                state_dict = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
-                torch.save(state_dict, save_path)
-                print(f"Saved best model (val_loss={val_loss:.4f})")
+        val_loss, val_ppl = evaluate(model, val_dataset, loss_fn, device, rank)
         
-        # Update epoch progress
-        if rank == 0:
-            epoch_bar.update(1)
-            epoch_bar.set_postfix(
-                train_loss=avg_train_loss,
-                val_loss=val_loss,
-                seq_len=current_seq_len,
-                lr=optimizer.param_groups[0]['lr'],
-                extended_epochs=total_epochs - original_epochs
-            )
-            status = f"Epoch {global_epoch+1}/{total_epochs} | Train: {avg_train_loss:.4f} | Val: {val_loss:.4f}"
-            if loss_below_one:
-                status += " | loss < 1.0 achieved"
-            else:
-                status += f" | loss > 1.0 - Adding epochs"
-            print(status)
+        # Save best model
+        if rank == 0 and val_loss < best_val_loss:
+            best_val_loss = val_loss
+            state_dict = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
+            torch.save(state_dict, save_path)
+            print(f"Saved best model (loss={val_loss:.4f}, ppl={val_ppl:.2f})")
         
-        global_epoch += 1
+        # Save checkpoint
+        if rank == 0:
+            torch.save({
+                'epoch': epoch,
+                'model_state': model.module.state_dict() if use_ddp else model.state_dict(),
+                'optimizer_state': optimizer.state_dict(),
+                'loss': total_loss / len(train_loader),
+            }, checkpoint_path)
     
-    # Final model save
-    if rank == 0:
-        state_dict = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
-        torch.save(state_dict, save_path)
-        print(f"Training complete. Final model saved to {save_path}")
-    
-    if config["use_ddp"] and world_size > 1:
+    # Cleanup
+    if use_ddp:
         dist.destroy_process_group()
     return model
 
-
 # =====================
-# 5. GENERATION FUNCTION
+# 5. GENERATION (Enhanced)
 # =====================
-def top_k_top_p_filtering(logits, top_k=config["top_k"], top_p=config["top_p"]):
+def top_k_top_p_filtering(logits, top_k=0, top_p=0.0, filter_value=-float('Inf')):
+    # Apply top-k filtering
     if top_k > 0:
-        # Keep only top-k tokens
         indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
-        logits[indices_to_remove] = float('-inf')
+        logits[indices_to_remove] = filter_value
     
+    # Apply nucleus sampling
     if top_p > 0.0:
-        # Convert to probabilities
         sorted_logits, sorted_indices = torch.sort(logits, descending=True)
         cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
         
         # Remove tokens with cumulative probability above threshold
         sorted_indices_to_remove = cumulative_probs > top_p
-        # Shift to keep first token above threshold
         sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
         sorted_indices_to_remove[..., 0] = 0
         
-        # Scatter indices to original positions
-        indices_to_remove = sorted_indices_to_remove.scatter(
-            dim=-1, index=sorted_indices, src=sorted_indices_to_remove
-        )
-        logits[indices_to_remove] = float('-inf')
+        # Scatter indices
+        indices_to_remove = sorted_indices_to_remove.scatter(-1, sorted_indices, sorted_indices_to_remove)
+        logits[indices_to_remove] = filter_value
     
     return logits
 
-def generate_text(model, tokenizer, prompt, max_length=config["max_length"], temperature=config["temperature"]):
-    """Generate text with prompt truncation and sampling"""
+def apply_repetition_penalty(logits, input_ids, penalty=1.2):
+    unique_ids = torch.unique(input_ids[-10:])  # Consider last 10 tokens
+    for uid in unique_ids:
+        if logits[uid] > 0:
+            logits[uid] /= penalty
+    return logits
+
+def generate_text(model, tokenizer, prompt, max_length=150, temperature=0.7):
     model.eval()
     input_ids = tokenizer.encode(prompt).ids
     
-    # Handle empty prompt case
-    if len(input_ids) == 0:
+    # Handle empty prompt
+    if not input_ids:
         input_ids = [tokenizer.token_to_id("<bos>")]
     
-    # Calculate maximum context length safely
+    # Truncate to model capacity
     max_ctx = config["seq_len"] - max_length
-    if max_ctx <= 0:
-        max_ctx = 1
-    original_length = len(input_ids)
-    
-    # Truncate prompt if needed (keep at least 1 token)
-    if original_length > max_ctx:
+    if len(input_ids) > max_ctx:
         input_ids = input_ids[-max_ctx:]
         print(f"Truncated prompt to {len(input_ids)} tokens")
     
-    eos_id = tokenizer.token_to_id("<eos>")
     device = next(model.parameters()).device
-    initial_length = len(input_ids)  # Store initial length for generated-only output
-
-    # NEW: Calculate maximum generation length based on model capacity
-    max_generate = min(max_length, config["seq_len"] - len(input_ids))
+    eos_id = tokenizer.token_to_id("<eos>")
     
-    for _ in range(max_generate):  # Use max_generate instead of max_length
-        inputs = torch.tensor([input_ids], dtype=torch.long).to(device)
-        
-        with torch.no_grad():
-            logits = model(inputs)[0, -1, :]  # Get last token logits
+    with torch.no_grad():
+        for _ in range(min(max_length, config["seq_len"] - len(input_ids))):
+            inputs = torch.tensor([input_ids], dtype=torch.long).to(device)
+            logits = model(inputs)[0, -1, :]
             
-        # Apply sampling techniques
-        logits = top_k_top_p_filtering(logits)
-        
-        # Apply temperature
-        logits = logits / temperature
-        
-        # Sample next token
-        probs = torch.softmax(logits, dim=-1)
-        next_id = torch.multinomial(probs, num_samples=1).item()
-        
-        input_ids.append(next_id)
-        if next_id == eos_id:
-            break
-
-    # Handle include_prompt option safely
-    if config.get("include_prompt", True):
-        return tokenizer.decode(input_ids, skip_special_tokens=True)
-    else:
-        # Return only generated portion
-        return tokenizer.decode(input_ids[initial_length:], skip_special_tokens=True)
+            # Apply penalties and sampling
+            logits = apply_repetition_penalty(logits, inputs[0])
+            logits = top_k_top_p_filtering(logits, config["top_k"], config["top_p"])
+            logits = logits / temperature
+            
+            # Sample next token
+            probs = torch.softmax(logits, dim=-1)
+            next_id = torch.multinomial(probs, num_samples=1).item()
+            
+            input_ids.append(next_id)
+            if next_id == eos_id:
+                break
+    
+    return tokenizer.decode(input_ids, skip_special_tokens=True)
 
 # =====================
 # MAIN EXECUTION
@@ -491,22 +416,19 @@ def generate_text(model, tokenizer, prompt, max_length=config["max_length"], tem
 def main():
     tokenizer = initialize_tokenizer()
     model_path = os.path.join(config["forModel"], config["model_path"])
-    model_exists = os.path.exists(model_path) and os.path.getsize(model_path) > 0
-    use_ddp = config["use_ddp"] and torch.cuda.device_count() > 1
     
-    # Determine if we need to train
-    if model_exists:
+    # Training decision
+    train_new = True
+    if os.path.exists(model_path) and os.path.getsize(model_path) > 0:
         retr = input("Model exists. Retrain? (y/n): ").lower().strip()
-        while retr not in ("y", "yes", "n", "no"):
-            retr = input("Please use yes(y) or no(n): ")
-        retrain = retr.startswith('y')
-    else:
-        retrain = True
+        train_new = retr in ("y", "yes")
     
-    # Training logic
-    if retrain:
+    # Training
+    if train_new:
+        use_ddp = config["use_ddp"] and torch.cuda.device_count() > 1
+        world_size = torch.cuda.device_count() if use_ddp else 1
+        
         if use_ddp:
-            world_size = torch.cuda.device_count()
             torch.multiprocessing.spawn(
                 train_model,
                 args=(tokenizer, world_size, config["forModel"], None),
@@ -514,74 +436,36 @@ def main():
                 join=True
             )
         else:
-            train_model(0, tokenizer, world_size=1, model=None)
+            train_model(0, tokenizer, world_size=1)
     
-    # Load best model for generation
+    # Load model
     model = NanoGPT(vocab_size=tokenizer.get_vocab_size())
     model.load_state_dict(torch.load(model_path, map_location=config["device"]))
     model.to(config["device"])
     
-    # Compile for faster inference (if available)
-    if sys.platform != "win32":
-        try:
-            model = torch.compile(model)
-        except Exception as e:
-            print("Could not compile model. Using uncompiled version:", e)
-    else:
-        print("Skipping torch.compile on Windows")
+    # Compile model if possible
+    if hasattr(torch, 'compile') and sys.platform != "win32":
+        model = torch.compile(model)
     
     # Interactive generation
-    print("\nGPT Ready! Type your prompt (or 'quit' to exit)")
-    
+    print("\nGPT Ready! Type prompts below ('exit' to quit)")
     while True:
-        prompt = input("\nPrompt: ")
-        if prompt.lower().strip() in ("", "quit", "exit"):
-            break
-        
-        response = generate_text(model, tokenizer, prompt)
-        
-        if config.get("repeat_generate"):
-            i = 1
-            print(f"{i}. prompting")
+        try:
+            prompt = input("\nPrompt: ")
+            if prompt.lower() in ('exit', 'quit'):
+                break
             
-            if config.get("include_prompt"):
-                while i < config.get("repeat_int"):
-                    response = generate_text(model, tokenizer, response)
-                    i +=1
-                    print(f"{i}. prompting")  
-            else:
-                while i < config.get("repeat_int"):
-                    response += generate_text(model, tokenizer, response)
-                    i +=1
-                    print(f"{i}. prompting")
-        else:
-            pass
+            response = generate_text(model, tokenizer, prompt)
+            print(f"Response: {response}")
             
-        print(f"Generated: {response}")
-        
-        if config.get("write_to_file"):
-            
-            os.makedirs("output", exist_ok=True)
-            txt_path = os.path.join("output", "*.txt")
-            txt_Files = glob.glob(txt_path)
-            
-            savedResponse = '\n'.join(textwrap.wrap(response, 80))
-            if txt_Files:
-                tempFiles = [os.path.basename(s).replace(".txt", "") for s in txt_Files]
-                tempFiles = [int(file) for file in tempFiles if file.isnumeric()]
-                        
-                i = str(max(tempFiles) + 1) + ".txt"
-                i_path = os.path.join("output", i)
-                os.makedirs(os.path.dirname(i_path), exist_ok=True)
-            
-            else:
-                i = "1.txt"
-                i_path = os.path.join("output", i)
-                os.makedirs(os.path.dirname(i_path), exist_ok=True)
-                
-            with open(i_path, "w", encoding="utf-8") as f:
-                f.write(savedResponse)
-        else:
-            pass
+            # Save to file
+            if config["write_to_file"]:
+                os.makedirs("output", exist_ok=True)
+                file_count = len(glob.glob("output/*.txt"))
+                with open(f"output/{file_count+1}.txt", "w", encoding="utf-8") as f:
+                    f.write('\n'.join(textwrap.wrap(response, 80)))
+        except Exception as e:
+            print(f"Error: {e}")
+
 if __name__ == "__main__":
     main()

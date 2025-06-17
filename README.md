@@ -4,23 +4,20 @@ A minimal, self-hosted GPT-style text generation model for local experimentation
 
 ## Features
 
-- **Curriculum Learning** - Sequence length starts small (32 tokens) and doubles during training for faster convergence
+- **Curriculum Learning** - Sequence length starts at 64 tokens and doubles during training for faster convergence
 - Extracts text from PDFs and TXT files in the `data/` directory
-- Trains a Byte-Pair Encoding (BPE) tokenizer using the `tokenizers` library (with ByteLevel for proper spacing)
-- Implements a simple GPT-like transformer model in PyTorch
-- Interactive text generation from the command line
+- Trains a Byte-Pair Encoding (BPE) tokenizer using `tokenizers` library (with custom pre-tokenization)
+- Implements a GPT-like transformer model in PyTorch with pre-normalization
+- Interactive text generation with repetition penalty
 - Supports top-k and top-p (nucleus) sampling for generation
 - Distributed training support via DDP (multi-GPU)
 - Visual training progress with per-epoch and per-batch loss
-- Ignores padding tokens in loss for stable training
-- Easy retraining and data refresh
 - Memory-mapped token storage for efficient dataset loading
-- Dynamic epoch extension (automatically extends training if loss > 1.0)
-- Automatic prompt truncation during generation
 - Generated text saved in `output/` directory
 - Learning rate warmup and decay
 - Gradient accumulation support
 - Torch.compile optimization for faster inference (Linux only)
+- Special tokens: `<unk>`, `<pad>`, `<bos>`, `<eos>`, `<sep>`, `<doc>`
 
 ## Setup
 
@@ -28,116 +25,94 @@ A minimal, self-hosted GPT-style text generation model for local experimentation
    Place your `.pdf` and `.txt` files in the `data/` directory.
 
 2. **Install Requirements**  
-   Install the required Python packages:
+   Install required Python packages:
 ```sh
-pip install torch tokenizers PyPDF2 tqdm numpy
+pip install torch tokenizers pdfplumber tqdm numpy
 ```
 
 3. **First Run / Training**
-   - Run the main script to train or load the model:
+   - Run main script to train or load model:
 ```sh
 python gpt.py
 ```
-   - If no model exists, you will be prompted to train a new one
-   - Training uses curriculum learning (sequence length starts at 32 and doubles during training)
-   - If a model exists, it will be loaded for text generation
+   - Training starts with 64-token sequences and doubles every 4 epochs
    - Training progress shows current sequence length and loss metrics
 
 4. **Interactive Generation**
-   - After training or loading, enter prompts and receive generated text using top-k/top-p sampling
-   - Generated responses are automatically saved in the `output/` directory as numbered text files
+   - Enter prompts and receive generated text using top-k/top-p sampling
+   - Generated responses saved in `output/` as numbered text files
 
-## Distributed Training (Optional)
-- If you have multiple GPUs and want to use Distributed Data Parallel (DDP):
-  - Set `"use_ddp": True` in `config.py`
-  - The script will automatically use all available GPUs for training
-  - Supports multi-node training via NCCL backend
+## Distributed Training
+- Enable with `"use_ddp": True` in `config.py`
+- Automatically uses available GPUs
+- Supports multi-node training via NCCL backend
+- Default world size: 3 GPUs
 
 ## Updating Data
-If you add new data files or remove old ones:
-
-1. Run the refresh script to rebuild the corpus and tokenizer:
+To update data files:
 ```sh
-python refresh.py
-```
-
-2. (Optional but recommended) Backup your previous model file (`forModel/gpt_model.pth`)
-
-3. Retrain the model with the updated data:
-```sh
-python gpt.py
+python refresh.py  # Rebuilds corpus and tokenizer
+python gpt.py      # Retrain model
 ```
 
 ## File Structure
 
-- `gpt.py` — Main script: model, training, and generation loop
-- `refresh.py` — Extracts text from PDFs/TXT and (re)trains tokenizer
-- `config.py` — Configuration dictionary for paths and hyperparameters
-- `forModel/` — Stores trained model, tokenizer, and memory-mapped tokens
-- `data/` — Place your source `.pdf` and `.txt` files here
-- `output/` — Directory for saving generated text outputs
+- `gpt.py` — Main script: model, training, generation
+- `refresh.py` — Extracts text from PDFs/TXT and trains tokenizer
+- `config.py` — Configuration for paths and hyperparameters
+- `forModel/` — Stores model, tokenizer, memory-mapped tokens
+- `data/` — Source `.pdf` and `.txt` files
+- `output/` — Generated text outputs
 - `test_gpt.py` — Unit tests for model components
 
 ## Configuration
-
-All paths and hyperparameters are set in `config.py`.
+All parameters set in `config.py`:
 
 **Curriculum Learning**
-- `start_seq_len`: Initial sequence length (default: 32)
-- `seq_len_double_interval`: Epochs before doubling sequence length (default: 6)
-- `warmup_epochs`: Learning rate warmup period (default: 4)
+- `start_seq_len`: Initial sequence length (64)
+- `seq_len_double_interval`: Epochs before doubling length (4)
+- `warmup_epochs`: Learning rate warmup period (4)
 
 **Model Architecture**
-- `vocab_size`: Vocabulary size (default: 10000)
-- `embed_size`: Embedding dimension (default: 192)
-- `n_layers`: Number of transformer layers (default: 6)
-- `n_heads`: Number of attention heads (default: 6)
-- `dropout_rate`: Regularization rate (default: 0.1)
+- `vocab_size`: Vocabulary size (20000)
+- `embed_size`: Embedding dimension (132)
+- `n_layers`: Transformer layers (3)
+- `n_heads`: Attention heads (6)
+- `drapout_rate`: Regularization rate (0.4)
 
 **Training Parameters**
-- `seq_len`: Maximum sequence length (default: 256)
-- `batch_size`: Training batch size (default: 8)
-- `epochs`: Minimum training epochs (default: 3)
-- `learning_rate`: Optimizer learning rate (default: 1e-4)
-- `gradient_accumulation_steps`: Steps for gradient accumulation (default: 4)
-- `lr_decay_steps`: Steps before learning rate decay (default: 500)
-- `weight_decay`: L2 regularization strength (default: 0.01)
+- `seq_len`: Maximum sequence length (512)
+- `batch_size`: Training batch size (3)
+- `epochs`: Training epochs (16)
+- `learning_rate`: Optimizer rate (5e-4)
+- `gradient_accumulation_steps`: Accumulation steps (4)
+- `weight_decay`: L2 regularization (0.01)
 
 **Generation Settings**
-- `top_k`: Top-k sampling parameter (default: 40)
-- `top_p`: Nucleus sampling parameter (default: 0.85)
-- `temperature`: Sampling temperature (default: 0.7)
-- `max_length`: Maximum generation length (default: 250)
+- `top_k`: Top-k sampling (50)
+- `top_p`: Nucleus sampling (0.92)
+- `temperature`: Sampling temperature (0.7)
+- `max_length`: Max generation length (150)
+- `repeat_generate`: Apply repetition penalty (True)
+- `repeat_int`: Penalty interval (10 tokens)
 
 **System**
-- `use_ddp`: Enable distributed training (default: True)
-- `num_workers`: Data loader workers (default: 4)
-- `device`: Training device (auto-detects GPU)
-- `world_size`: DDP world size (default: 3)
+- `use_ddp`: Distributed training (True)
+- `num_workers`: Data loader workers (4)
+- `device`: Auto-detects GPU
+- `world_size`: DDP processes (3)
 
 ## Notes
 
-* Training uses curriculum learning for faster convergence - sequence length starts small and increases during training
-
-* Memory-mapped token files (`.tokens`) are generated for faster dataset loading
-
-* Padding tokens are ignored in loss calculation for more stable training
-
-* The model and tokenizer are always kept in sync; if you refresh data or tokenizer, retrain the model
-
-* Training and generation work on both CPU and GPU (DDP supported for multi-GPU setups)
-
-* Tokenizer uses ByteLevel pre-tokenizer and decoder for correct spacing in generated text
-
-* Last real token in sequences is automatically set to `<eos>` during training
-
+* Curriculum learning starts with 64-token sequences
+* Memory-mapped token files (`.tokens`) enable fast dataset loading
+* Tokenizer uses custom pre-tokenization (whitespace/punctuation/digits)
+* Training includes 90/10 train/validation split
+* Generation applies repetition penalty to reduce looping
+* Model automatically compiles with `torch.compile` on Linux
+* PDF extraction uses pdfplumber for better text handling
+* Text cleaning handles OCR artifacts and special characters
 * Includes unit tests for core functionality (`test_gpt.py`)
-
-* Training automatically extends if loss remains above 1.0
-
-* Generated text is saved in `output/` directory as numbered text files
-
-* Torch.compile optimization is automatically applied on Linux systems
 
 ## License
 

@@ -19,7 +19,7 @@ config = {
     "batch_size": 3,             # int
     "epochs":16,                 # int
     "seq_len_double_interval":4,
-    "learning_rate": 5e-3,       # float
+    "learning_rate": 5e-4,       # float
     "gradient_accumulation_steps": 4,
     "lr_decay_steps": 500,
     "learning_rate_decay": 0.9,

@@ -540,20 +540,20 @@ def main():
         
         response = generate_text(model, tokenizer, prompt)
         
-        if config.get("repeat_generate") == True and config.get("include_prompt") == True:
-            i = 0
+        if config.get("repeat_generate"):
+            i = 1
             print(f"{i}. prompting")
-            while i-1 < config.get("repeat_int"):
-                response = generate_text(model, tokenizer, response)
-                i +=1
-                print(f"{i}. prompting")    
-        elif config.get("repeat_generate") == True and config.get("include_prompt") == False:
-            i = 0
-            print(f"{i}. prompting")
-            while i < config.get("repeat_int"):
-                response += generate_text(model, tokenizer, response)
-                i +=1
-                print(f"{i}. prompting")
+            
+            if config.get("include_prompt"):
+                while i < config.get("repeat_int"):
+                    response = generate_text(model, tokenizer, response)
+                    i +=1
+                    print(f"{i}. prompting")  
+            else:
+                while i < config.get("repeat_int"):
+                    response += generate_text(model, tokenizer, response)
+                    i +=1
+                    print(f"{i}. prompting")
         else:
             pass
             
@@ -568,9 +568,9 @@ def main():
             savedResponse = '\n'.join(textwrap.wrap(response, 80))
             if txt_Files:
                 tempFiles = [os.path.basename(s).replace(".txt", "") for s in txt_Files]
-                tempFiles = [file for file in tempFiles if type(file) == int]
+                tempFiles = [int(file) for file in tempFiles if file.isnumeric()]
                         
-                i = str(int(max(tempFiles)) + 1) + ".txt"
+                i = str(max(tempFiles) + 1) + ".txt"
                 i_path = os.path.join("output", i)
                 os.makedirs(os.path.dirname(i_path), exist_ok=True)
             

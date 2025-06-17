@@ -17,6 +17,34 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+def clean_text(text):
+    # Remove non-printable characters except common punctuation
+    text = re.sub(r'[^\x20-\x7E\u00A0-\u00FF\u2018-\u201F]', ' ', text)
+    
+    # Normalize whitespace and special characters
+    text = re.sub(r'\s+', ' ', text)  # Collapse multiple spaces
+    text = re.sub(r'[‐‑‒–—―]', '-', text)  # Normalize hyphens/dashes
+    text = re.sub(r'[“”]', '"', text)  # Normalize quotes
+    text = re.sub(r'[‘’]', "'", text)   # Normalize apostrophes
+        
+    # Fix common OCR artifacts
+    text = re.sub(r'\b(\w+)\s+-\s+(\w+)\b', r'\1-\2', text)  # Fix hyphenated words
+    text = re.sub(r'\b(\w+)\s*=\s*(\w+)\b', r'\1=\2', text)  # Fix equals signs
+    
+    # Remove orphaned characters
+    text = re.sub(r'\s[^\w\s]\s', ' ', text)
+    
+    # Handle bullet points and numbered lists
+    text = re.sub(r'\s*[\u2022\u25E6]\s*', '\n• ', text)
+    text = re.sub(r'\s*\d+\.\s+', '\n1. ', text)
+    
+    text = re.sub(r'(?<!\w)\.(?!\w)', ' ', text)
+    text = re.sub(r'\s([.,!?;:](?:\s|$))', r'\1', text)
+    
+    # Final cleanup
+    text = text.strip()
+    return text
+
 def extract_text_from_pdfs_and_txts(folder=None, forModel=None):
     if folder is None:
         folder = config["forData"]
@@ -109,36 +137,7 @@ def extract_text_from_pdfs_and_txts(folder=None, forModel=None):
     
     # Combine all text with separator
     combined_text = "\n\n".join(textAll)
-    
-    # Enhanced text cleaning pipeline
-    def clean_text(text):
-        # Remove non-printable characters except common punctuation
-        text = re.sub(r'[^\x20-\x7E\u00A0-\u00FF\u2018-\u201F]', ' ', text)
-        
-        # Normalize whitespace and special characters
-        text = re.sub(r'\s+', ' ', text)  # Collapse multiple spaces
-        text = re.sub(r'[‐‑‒–—―]', '-', text)  # Normalize hyphens/dashes
-        text = re.sub(r'[“”]', '"', text)  # Normalize quotes
-        text = re.sub(r'[‘’]', "'", text)   # Normalize apostrophes
-        
-        # Fix common OCR artifacts
-        text = re.sub(r'\b(\w+)\s+-\s+(\w+)\b', r'\1-\2', text)  # Fix hyphenated words
-        text = re.sub(r'\b(\w+)\s*=\s*(\w+)\b', r'\1=\2', text)  # Fix equals signs
-        
-        # Remove orphaned characters
-        text = re.sub(r'\s[^\w\s]\s', ' ', text)
-        
-        # Handle bullet points and numbered lists
-        text = re.sub(r'\s*[\u2022\u25E6]\s*', '\n• ', text)
-        text = re.sub(r'\s*\d+\.\s+', '\n1. ', text)
-        
-        text = re.sub(r'(?<!\w)\.(?!\w)', ' ', text)
-        text = re.sub(r'\s([.,!?;:](?:\s|$))', r'\1', text)
-        
-        # Final cleanup
-        text = text.strip()
-        return text
-    
+
     cleaned_text = clean_text(combined_text)
     
     # Save cleaned corpus
@@ -174,11 +173,8 @@ def create_tokenizer(text, forModel=None):
     
     # Initialize tokenizer
     tokenizer = Tokenizer(models.BPE(unk_token="<unk>"))
-    tokenizer.pre_tokenizer = pre_tokenizers.Sequence([
-        pre_tokenizers.WhitespaceSplit(),
-        pre_tokenizers.Punctuation(),
-        pre_tokenizers.Digits(individual_digits=False)
-    ])
+    
+    tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel()
     
     trainer = trainers.BpeTrainer(
         vocab_size=config["vocab_size"],
@@ -221,7 +217,6 @@ def create_tokenizer(text, forModel=None):
 
 def token_save(tokenizer, corpus_path):
     token_path = corpus_path + ".tokens"
-    corpus_mtime = os.path.getmtime(corpus_path) if os.path.exists(corpus_path) else 0
     
     if not os.path.exists(token_path) or os.path.getsize(token_path) == 0:
         logger.info("Tokenizing corpus...")

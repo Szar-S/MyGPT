@@ -6,40 +6,41 @@ config = {
     "data_corpus": "data_corpus.txt",
     "bpe_tokenizer": "bpe_tokenizer.json",
     
-    # Model Architecture 
-    "vocab_size": 20000,         # int
-    "embed_size": 132,           # int
-    "n_layers": 3,               # int
-    "n_heads": 6,                # int
-    "drapout_rate": 0.4,                
+    # Model Architecture
+    "vocab_size": 8000,
+    "embed_size": 128,
+    "n_layers": 4,
+    "n_heads": 4,
+    "dropout_rate": 0.3,
     
     # Training Parameters
-    "seq_len": 512,              # int
+    "seq_len": 256,
     "start_seq_len": 64,
-    "batch_size": 3,             # int
-    "epochs":16,                 # int
-    "seq_len_double_interval":4,
-    "learning_rate": 5e-4,       # float
-    "gradient_accumulation_steps": 4,
-    "lr_decay_steps": 500,
-    "learning_rate_decay": 0.9,
-    "weight_decay": 0.01,
-    "warmup_epochs":4,
+    "batch_size": 4,
+    "epochs": 24,
+    "seq_len_double_interval": 6,
+    "learning_rate": 3e-4,
+    "gradient_accumulation_steps": 8,
+    "lr_decay_steps": 1000,
+    "weight_decay": 0.05,
+    "warmup_epochs": 6,
     
     # Generation Settings
-    "top_k": 50,                 # int
-    "top_p": 0.92,                # float
-    "temperature": 0.7,           # float
-    "min_data_size": 300,        # int
-    "max_length": 150,            # int
+    "top_k": 30,
+    "top_p": 0.85,
+    "temperature": 0.8,
+    "min_data_size": 100,
+    "max_length": 200,
     "include_prompt": False,
     "repeat_generate": True,
-    "repeat_int": 10,
+    "repeat_int": 5,
     "write_to_file": True,
     
-    # System
-    "use_ddp": True,            # bool
-    "num_workers": 4,            #int
-    "device": "cuda" if torch.cuda.is_available() else "cpu",
-    "world_size": 3
+    # System Features
+    "use_ddp": False,
+    "use_amp": True,
+    "num_workers": 2,
+    "repetition_penalty": 1.25,
+    "checkpoint_every": 500,
+    "device": "cuda" if torch.cuda.is_available() else "cpu"
 }

@@ -110,6 +110,7 @@ class NanoGPT(nn.Module):
         dropout_rate = config.get("dropout_rate", 0.0)
         
         self.token_embed = nn.Embedding(vocab_size, embed_size)
+        self.max_positions = 1024
         self.pos_embed = nn.Embedding(config["seq_len"], embed_size)
         
         # Transformer layers with residual connections
@@ -132,6 +133,9 @@ class NanoGPT(nn.Module):
         
         # Create position IDs
         pos_ids = torch.arange(0, seq_len, device=device).unsqueeze(0)
+        
+        if seq_len > self.max_positions:
+            raise ValueError(f"Sequence length {seq_len} exceeds maximum position {self.max_positions}")
         
         # Embed tokens and positions
         token_embeds = self.token_embed(input_ids)
@@ -437,7 +441,9 @@ def generate_text(model, tokenizer, prompt, max_length=config["max_length"], tem
         input_ids = [tokenizer.token_to_id("<bos>")]
     
     # Calculate maximum context length safely
-    max_ctx = max(1, config["seq_len"] - max_length - 1)  # Ensure at least 1 token
+    max_ctx = config["seq_len"] - max_length
+    if max_ctx <= 0:
+        max_ctx = 1
     original_length = len(input_ids)
     
     # Truncate prompt if needed (keep at least 1 token)
@@ -449,7 +455,10 @@ def generate_text(model, tokenizer, prompt, max_length=config["max_length"], tem
     device = next(model.parameters()).device
     initial_length = len(input_ids)  # Store initial length for generated-only output
 
-    for _ in range(max_length):
+    # NEW: Calculate maximum generation length based on model capacity
+    max_generate = min(max_length, config["seq_len"] - len(input_ids))
+    
+    for _ in range(max_generate):  # Use max_generate instead of max_length
         inputs = torch.tensor([input_ids], dtype=torch.long).to(device)
         
         with torch.no_grad():
@@ -559,9 +568,8 @@ def main():
             savedResponse = '\n'.join(textwrap.wrap(response, 80))
             if txt_Files:
                 tempFiles = [os.path.basename(s).replace(".txt", "") for s in txt_Files]
-                while not str(max(tempFiles)).isnumeric():
-                    tempFiles.pop(max(tempFiles))
-                
+                tempFiles = [file for file in tempFiles if type(file) == int]
+                        
                 i = str(int(max(tempFiles)) + 1) + ".txt"
                 i_path = os.path.join("output", i)
                 os.makedirs(os.path.dirname(i_path), exist_ok=True)

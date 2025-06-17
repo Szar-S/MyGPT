@@ -245,10 +245,16 @@ def train_model(rank, tokenizer, world_size=0, forModel=config["forModel"], mode
         shuffle=False,
         num_workers=config["num_workers"]
     )
+    
     # Model initialization
     vocab_size = tokenizer.get_vocab_size()
     if model is None:
         model = NanoGPT(vocab_size=vocab_size)
+        # Load existing model weights if available
+        if os.path.exists(save_path) and os.path.getsize(save_path) > 0:
+            model.load_state_dict(torch.load(save_path, map_location=device))
+            if rank == 0:
+                print(f"Loaded existing model weights from {save_path}")
     
     # Load checkpoint if available
     start_epoch = 0
@@ -351,6 +357,11 @@ def train_model(rank, tokenizer, world_size=0, forModel=config["forModel"], mode
                 'optimizer_state': optimizer.state_dict(),
                 'loss': total_loss / len(train_loader),
             }, checkpoint_path)
+    
+    # Delete checkpoint after training
+    if rank == 0 and os.path.exists(checkpoint_path):
+        os.remove(checkpoint_path)
+        print(f"Deleted checkpoint: {checkpoint_path}")
     
     # Cleanup
     if use_ddp:

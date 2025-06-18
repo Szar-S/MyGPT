@@ -81,6 +81,10 @@ class TextDataset(Dataset):
             "eos": tokenizer.token_to_id("<eos>"),
             "pad": tokenizer.token_to_id("<pad>")
         }
+        
+        self.bos_id = self.special_ids["bos"]
+        self.eos_id = self.special_ids["eos"]
+        self.pad_id = self.special_ids["pad"]
 
     def __len__(self):
         return max(1, (self.num_tokens - 1) // self.seq_len)
@@ -166,7 +170,8 @@ class NanoGPT(nn.Module):
         x = self.embed_norm(x)
         
         # Causal mask
-        mask = nn.Transformer.generate_square_subsequent_mask(seq_len).to(device)
+        mask = torch.triu(torch.ones(seq_len, seq_len) * float('-inf'))
+        mask = mask.masked_fill(mask == 0, 0).to(device)
         
         # Transformer processing
         for block in self.blocks:
@@ -194,14 +199,14 @@ def evaluate(model, val_loader, loss_fn, device, rank):
             
             with torch.amp.autocast('cuda', enabled=config["use_amp"]):
                 logits = model(inputs)
+                # Calculate loss per token (ignore padding)
                 loss = loss_fn(logits.view(-1, logits.size(-1)), targets.view(-1))
             
             total_loss += loss.item() * targets.numel()
             total_tokens += targets.numel()
     
     # Gather metrics across devices if DDP
-    if dist.is_initialized():  # Check if DDP is active
-        # Convert to tensors for proper reduction
+    if dist.is_initialized():
         total_loss_tensor = torch.tensor(total_loss).to(device)
         total_tokens_tensor = torch.tensor(total_tokens).to(device)
         
@@ -212,7 +217,8 @@ def evaluate(model, val_loader, loss_fn, device, rank):
         total_tokens = total_tokens_tensor.item()
     
     avg_loss = total_loss / total_tokens
-    perplexity = torch.exp(torch.tensor(avg_loss)).item()
+    # FIX: Proper perplexity calculation
+    perplexity = torch.exp(torch.tensor(avg_loss)).item() if avg_loss < 15 else float('inf')
     
     if rank == 0:
         print(f"Validation Loss: {avg_loss:.4f} | Perplexity: {perplexity:.2f}")
@@ -278,21 +284,11 @@ def train_model(rank, tokenizer, world_size=0, forModel=config["forModel"], mode
         eps=1e-6
     )
     
-    # Scheduler
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=config["learning_rate"],
-        total_steps=len(train_dataset) // config["batch_size"] * config["epochs"],
-        pct_start=0.1,
-        anneal_strategy='cos'
-    )
-    
     # Loss function
     loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer.token_to_id("<pad>"))
     scaler = torch.amp.GradScaler('cuda', enabled=config["use_amp"])
     
-    # Training loop
-    best_val_loss = float('inf')
+    # Training loopbest_val_loss = float('inf')
     for epoch in range(start_epoch, config["epochs"]):
         # Create data loader
         sampler = torch.utils.data.distributed.DistributedSampler(
@@ -310,34 +306,54 @@ def train_model(rank, tokenizer, world_size=0, forModel=config["forModel"], mode
         
         if sampler:
             sampler.set_epoch(epoch)
+        # Scheduler
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=len(train_loader) * config["epochs"],
+            eta_min=config["learning_rate"] * 0.1
+        )
         
         # Training
         model.train()
-        total_loss = 0
+        total_loss = 0.0
+        total_steps = 0
+        optimizer.zero_grad()
+        
         progress = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config['epochs']}", disable=(rank != 0))
         
-        for batch in progress:
+        for step, batch in enumerate(progress):
             inputs = batch["input_ids"].to(device)
             targets = batch["labels"].to(device)
             
             with torch.amp.autocast('cuda', enabled=config["use_amp"]):
                 logits = model(inputs)
-                loss = loss_fn(logits.view(-1, logits.size(-1)), targets.view(-1))
-                loss = loss / config["gradient_accumulation_steps"]
+                # Calculate actual loss
+                actual_loss = loss_fn(logits.view(-1, logits.size(-1)), targets.view(-1))
+                # Scale loss for gradient accumulation
+                scaled_loss = actual_loss / config["gradient_accumulation_steps"]
             
-            scaler.scale(loss).backward()
-            total_loss += loss.item() * config["gradient_accumulation_steps"]
+            scaler.scale(scaled_loss).backward()
+            
+            # Accumulate actual loss
+            total_loss += actual_loss.item()
+            total_steps += 1
+            
+            # Display actual loss in progress bar
+            progress.set_postfix(loss=f"{actual_loss.item():.4f}")
             
             # Gradient accumulation
-            if (progress.n + 1) % config["gradient_accumulation_steps"] == 0:
+            if (step + 1) % config["gradient_accumulation_steps"] == 0:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
                 scheduler.step()
-            
-            progress.set_postfix(loss=loss.item())
+        
+        # Calculate epoch loss
+        epoch_loss = total_loss / total_steps
+        if rank == 0:
+            print(f"Epoch {epoch+1} Train Loss: {epoch_loss:.4f}")
         
         # Validation
         val_loss, val_ppl = evaluate(model, val_loader, loss_fn, device, rank)
@@ -355,7 +371,7 @@ def train_model(rank, tokenizer, world_size=0, forModel=config["forModel"], mode
                 'epoch': epoch,
                 'model_state': model.module.state_dict() if use_ddp else model.state_dict(),
                 'optimizer_state': optimizer.state_dict(),
-                'loss': total_loss / len(train_loader),
+                'loss': epoch_loss,
             }, checkpoint_path)
     
     # Delete checkpoint after training
